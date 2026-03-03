@@ -22,28 +22,50 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
 
     switch ((esp_mqtt_event_id_t)event_id) {
-        case MQTT_EVENT_CONNECTED:
+        case MQTT_EVENT_CONNECTED: {
             ESP_LOGI(TAG, "MQTT connected");
-            esp_mqtt_client_publish(g_app.mqtt, MQTT_STATUS_TOPIC, "online", 0, 1, 1);
-            esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_OTA_TOPIC, 1);
+            int status_id = esp_mqtt_client_publish(g_app.mqtt, MQTT_STATUS_TOPIC, "online", 0, 1, 1);
+            int debug_id = esp_mqtt_client_publish(g_app.mqtt, MQTT_DEBUG_TOPIC, "boot_connected", 0, 0, 0);
+            int sub_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_OTA_TOPIC, 1);
+            int sub_leak_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_LEAK_THRESHOLD_TOPIC, 1);
+            mqtt_publish_homeassistant_discovery();
+            ESP_LOGI(TAG, "MQTT publish status msg_id=%d topic=%s", status_id, MQTT_STATUS_TOPIC);
+            ESP_LOGI(TAG, "MQTT publish debug msg_id=%d topic=%s", debug_id, MQTT_DEBUG_TOPIC);
+            ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_id, MQTT_CMD_OTA_TOPIC);
+            ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_leak_id, MQTT_CMD_LEAK_THRESHOLD_TOPIC);
             break;
-        case MQTT_EVENT_DATA:
+        }
+        case MQTT_EVENT_DATA: {
+            char topic_buf[128] = {0};
+            char data_buf[256] = {0};
+            int tlen = event->topic_len < (int)sizeof(topic_buf) - 1 ? event->topic_len : (int)sizeof(topic_buf) - 1;
+            int dlen = event->data_len < (int)sizeof(data_buf) - 1 ? event->data_len : (int)sizeof(data_buf) - 1;
+            memcpy(topic_buf, event->topic, tlen);
+            memcpy(data_buf, event->data, dlen);
+            topic_buf[tlen] = '\0';
+            data_buf[dlen] = '\0';
+            ESP_LOGI(TAG, "MQTT data topic=%s payload=%s", topic_buf, data_buf);
+
             if (event->topic_len == (int)strlen(MQTT_CMD_OTA_TOPIC) &&
                 strncmp(event->topic, MQTT_CMD_OTA_TOPIC, event->topic_len) == 0) {
-                char url[256] = {0};
-                int copy_len = event->data_len;
-                if (copy_len > (int)sizeof(url) - 1) copy_len = (int)sizeof(url) - 1;
-                memcpy(url, event->data, copy_len);
-                url[copy_len] = '\0';
-                ESP_LOGI(TAG, "OTA command received: %s", url);
-                ota_service_trigger_url(url);
+                ESP_LOGI(TAG, "OTA command received: %s", data_buf);
+                ota_service_trigger_url(data_buf);
+            } else if (event->topic_len == (int)strlen(MQTT_CMD_LEAK_THRESHOLD_TOPIC) &&
+                       strncmp(event->topic, MQTT_CMD_LEAK_THRESHOLD_TOPIC, event->topic_len) == 0) {
+                ESP_LOGI(TAG, "Leak threshold command received: %s", data_buf);
+                leak_threshold_handle_cmd(data_buf);
             }
             break;
+        }
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT disconnected");
             break;
         case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "MQTT event error");
+            ESP_LOGE(TAG, "MQTT event error type=%d esp_tls_last_esp_err=0x%x tls_stack_err=0x%x tls_cert_flags=0x%x", 
+                     event->error_handle ? event->error_handle->error_type : -1,
+                     event->error_handle ? event->error_handle->esp_tls_last_esp_err : 0,
+                     event->error_handle ? event->error_handle->esp_tls_stack_err : 0,
+                     event->error_handle ? event->error_handle->esp_tls_cert_verify_flags : 0);
             break;
         default:
             break;
