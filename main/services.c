@@ -11,6 +11,7 @@
 #include "mqtt_client.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
 #include "esp_rom_sys.h"
@@ -73,6 +74,25 @@ static void bme_delay_us(uint32_t period, void *intf_ptr) {
     }
 }
 
+static void status_led_task(void *arg) {
+    (void)arg;
+
+    const int led_on_level = STATUS_LED_ACTIVE_LOW ? 0 : 1;
+    const int led_off_level = STATUS_LED_ACTIVE_LOW ? 1 : 0;
+
+    gpio_set_level(STATUS_LED_GPIO, led_off_level);
+    gpio_set_level(STATUS_LED_GPIO_2, led_off_level);
+
+    while (1) {
+        gpio_set_level(STATUS_LED_GPIO, led_on_level);
+        gpio_set_level(STATUS_LED_GPIO_2, led_on_level);
+        vTaskDelay(pdMS_TO_TICKS(STATUS_LED_BLINK_MS));
+        gpio_set_level(STATUS_LED_GPIO, led_off_level);
+        gpio_set_level(STATUS_LED_GPIO_2, led_off_level);
+        vTaskDelay(pdMS_TO_TICKS(STATUS_LED_BLINK_MS));
+    }
+}
+
 static void bme688_task(void *arg) {
     struct bme68x_conf conf = {0};
     conf.filter = BME68X_FILTER_OFF;
@@ -99,15 +119,16 @@ static void bme688_task(void *arg) {
             uint8_t n_fields = 0;
             int8_t rs = bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &s_bme);
             if (rs == BME68X_OK && n_fields > 0) {
-                float t_c = data.temperature / 100.0f;
-                float p_hpa = data.pressure / 100.0f;
-                float h_pct = data.humidity / 1000.0f;
+                float t_c = (float)data.temperature;
+                float p_hpa = (float)data.pressure / 100.0f;
+                float h_pct = (float)data.humidity;
                 float gas_ohm = (float)data.gas_resistance;
 
                 char payload[192];
                 snprintf(payload, sizeof(payload), "{\"temperature_c\":%.2f,\"humidity_pct\":%.2f,\"pressure_hpa\":%.2f,\"gas_ohm\":%.0f}",
                          (double)t_c, (double)h_pct, (double)p_hpa, (double)gas_ohm);
                 esp_mqtt_client_publish(g_app.mqtt, MQTT_BME_TOPIC_PREFIX, payload, 0, 0, 0);
+                ESP_LOGI(TAG, "BME688 sample T=%.2fC RH=%.2f%% P=%.2fhPa Gas=%.0fΩ", (double)t_c, (double)h_pct, (double)p_hpa, (double)gas_ohm);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(15000));
@@ -303,7 +324,7 @@ static void mqtt_publish_ha_binary(const char *obj_id, const char *name, const c
 void mqtt_publish_homeassistant_discovery(void) {
     if (!g_app.mqtt) return;
 
-    // BME688
+    // Environmental sensor at 0x77, when present as BME688-compatible
     mqtt_publish_ha_sensor("sensor", "herc_hotel_p4_bme_temp", "Herc Hotel Temperature", MQTT_BME_TOPIC_PREFIX,
                            "°C", "temperature", "{{ value_json.temperature_c }}");
     mqtt_publish_ha_sensor("sensor", "herc_hotel_p4_bme_humidity", "Herc Hotel Humidity", MQTT_BME_TOPIC_PREFIX,
@@ -314,7 +335,7 @@ void mqtt_publish_homeassistant_discovery(void) {
                            "Ω", NULL, "{{ value_json.gas_ohm }}");
 
     // ADS1115 channels
-    for (int addr = 0x48; addr <= 0x4A; addr++) {
+    for (int addr = 0x48; addr <= 0x4B; addr++) {
         for (int ch = 0; ch < 4; ch++) {
             char topic[96], obj_id[64], name[96], vt[64];
             snprintf(topic, sizeof(topic), "%s/ads1115/0x%02X/ch%d", MQTT_I2C_TOPIC_PREFIX, addr, ch);
@@ -449,18 +470,22 @@ void i2c_service_init(void) {
         ESP_LOGI(TAG, "I2C MQTT scan topic: %s", MQTT_I2C_SCAN_TOPIC);
         xTaskCreate(i2c_publish_task, "i2c_pub_task", 6144, NULL, 4, NULL);
 
-        s_bme.intf = BME68X_I2C_INTF;
-        s_bme.read = bme_i2c_read;
-        s_bme.write = bme_i2c_write;
-        s_bme.delay_us = bme_delay_us;
-        s_bme.intf_ptr = &s_bme_addr;
-        s_bme.amb_temp = 25;
-        if (bme68x_init(&s_bme) == BME68X_OK) {
-            s_bme_ready = true;
-            ESP_LOGI(TAG, "BME688 initialized at 0x%02X", s_bme_addr);
-            xTaskCreate(bme688_task, "bme688_task", 6144, NULL, 4, NULL);
+        if (i2c_probe(s_bme_addr)) {
+            s_bme.intf = BME68X_I2C_INTF;
+            s_bme.read = bme_i2c_read;
+            s_bme.write = bme_i2c_write;
+            s_bme.delay_us = bme_delay_us;
+            s_bme.intf_ptr = &s_bme_addr;
+            s_bme.amb_temp = 25;
+            if (bme68x_init(&s_bme) == BME68X_OK) {
+                s_bme_ready = true;
+                ESP_LOGI(TAG, "BME688 initialized at 0x%02X", s_bme_addr);
+                xTaskCreate(bme688_task, "bme688_task", 6144, NULL, 4, NULL);
+            } else {
+                ESP_LOGW(TAG, "Device present at 0x%02X but BME688 init failed, leaving env sensor disabled for now", s_bme_addr);
+            }
         } else {
-            ESP_LOGW(TAG, "BME688 init failed at 0x%02X", s_bme_addr);
+            ESP_LOGW(TAG, "No environmental sensor detected at 0x%02X", s_bme_addr);
         }
     } else {
         ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(err));
@@ -559,4 +584,18 @@ void uart_service_init(void) {
 
 void health_service_init(void) {
     xTaskCreate(health_task, "health_task", 4096, NULL, 4, NULL);
+}
+
+void status_led_service_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << STATUS_LED_GPIO) | (1ULL << STATUS_LED_GPIO_2),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    xTaskCreate(status_led_task, "status_led_task", 2048, NULL, 2, NULL);
+    ESP_LOGI(TAG, "Status LEDs blinking on GPIO%d and GPIO%d at 1 Hz", STATUS_LED_GPIO, STATUS_LED_GPIO_2);
 }

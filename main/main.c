@@ -10,6 +10,7 @@
 #include "esp_eth.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
+#include "esp_eth_phy_ip101.h"
 
 #include "app_config.h"
 #include "app_state.h"
@@ -164,6 +165,7 @@ void app_main(void) {
     i2c_service_init();
     uart_service_init();
     health_service_init();
+    status_led_service_init();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
