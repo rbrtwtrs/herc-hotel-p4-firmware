@@ -3,3 +3,5 @@ dependencies:
     version: '>=6.0.0'
   espressif/mqtt: "*"
   espressif/ip101: "*"
+  sensor_init:
+    path: ${IDF_PATH}/examples/peripherals/camera/common_components/sensor_init

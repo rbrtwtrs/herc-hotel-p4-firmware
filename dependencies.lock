@@ -1,4 +1,49 @@
 dependencies:
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
+  espressif/esp_cam_sensor:
+    component_hash: db5b1c725799dced61e7b100dc027e1e59558c9973d7e1ed8ce42a5ec89da31c
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: espressif/esp_sccb_intf
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.0.5'
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32p4
+    - esp32s3
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    version: 1.7.0
+  espressif/esp_sccb_intf:
+    component_hash: c071b189e49f40940722aea01a5489f873385cc39cd5b14012341135b85d1a9d
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.0.8
   espressif/ip101:
     component_hash: e3be457b9ae50d7b348e5418ef1a334b3f943a1f0df16a4d42767b89ae15d533
     dependencies:
@@ -26,10 +71,21 @@ dependencies:
     source:
       type: idf
     version: 6.0.0
+  sensor_init:
+    dependencies:
+    - name: espressif/esp_cam_sensor
+      version: ^1.2.1
+    - name: idf
+      version: '>=5.3.0'
+    source:
+      path: ..\..\..\..\..\esp\v6.0\esp-idf\examples\peripherals\camera\common_components\sensor_init
+      type: local
+    version: '*'
 direct_dependencies:
 - espressif/ip101
 - espressif/mqtt
 - idf
-manifest_hash: 404243f88dc32f8b82cff76e520f93ce64ffe59df67191bfadba4189cb5ad892
+- sensor_init
+manifest_hash: 8a44526d7285510c7278ee0f97cca95dc522047a4876ab13027f7ac39c03612c
 target: esp32p4
 version: 3.0.0
