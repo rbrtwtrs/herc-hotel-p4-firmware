@@ -1,0 +1,4 @@
+# Enable external PSRAM on ESP32-P4-Nano for camera/framebuffer bring-up.
+# Keep this in sdkconfig.defaults so local menuconfig can still adjust details.
+CONFIG_SPIRAM=y
+CONFIG_CAMERA_OV5647=y

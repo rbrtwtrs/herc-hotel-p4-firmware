@@ -6,6 +6,7 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
 #include "nvs_flash.h"
@@ -19,6 +20,21 @@
 static const char *TAG = "herc_hotel_p4";
 app_state_t g_app = {0};
 
+static void log_memory_status(const char *stage) {
+    size_t free_heap = esp_get_free_heap_size();
+    size_t min_free_heap = esp_get_minimum_free_heap_size();
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    ESP_LOGI(TAG,
+             "Memory @ %s: free_heap=%u min_free_heap=%u free_internal=%u free_spiram=%u",
+             stage,
+             (unsigned)free_heap,
+             (unsigned)min_free_heap,
+             (unsigned)free_internal,
+             (unsigned)free_spiram);
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
 
@@ -29,11 +45,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             int debug_id = esp_mqtt_client_publish(g_app.mqtt, MQTT_DEBUG_TOPIC, "boot_connected", 0, 0, 0);
             int sub_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_OTA_TOPIC, 1);
             int sub_leak_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_LEAK_THRESHOLD_TOPIC, 1);
+            int sub_camera_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_CAMERA_SNAP_TOPIC, 1);
             mqtt_publish_homeassistant_discovery();
             ESP_LOGI(TAG, "MQTT publish status msg_id=%d topic=%s", status_id, MQTT_STATUS_TOPIC);
             ESP_LOGI(TAG, "MQTT publish debug msg_id=%d topic=%s", debug_id, MQTT_DEBUG_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_id, MQTT_CMD_OTA_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_leak_id, MQTT_CMD_LEAK_THRESHOLD_TOPIC);
+            ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_camera_id, MQTT_CMD_CAMERA_SNAP_TOPIC);
             break;
         }
         case MQTT_EVENT_DATA: {
@@ -55,6 +73,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                        strncmp(event->topic, MQTT_CMD_LEAK_THRESHOLD_TOPIC, event->topic_len) == 0) {
                 ESP_LOGI(TAG, "Leak threshold command received: %s", data_buf);
                 leak_threshold_handle_cmd(data_buf);
+            } else if (event->topic_len == (int)strlen(MQTT_CMD_CAMERA_SNAP_TOPIC) &&
+                       strncmp(event->topic, MQTT_CMD_CAMERA_SNAP_TOPIC, event->topic_len) == 0) {
+                ESP_LOGI(TAG, "Camera snapshot command received: %s", data_buf);
+                camera_service_trigger_snapshot(data_buf);
             }
             break;
         }
@@ -125,6 +147,7 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
     ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
     ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
 
+    http_snapshot_service_start();
     start_mqtt();
 }
 
@@ -160,12 +183,17 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
 
+    log_memory_status("boot");
+
     init_ethernet();
     ota_service_init();
     i2c_service_init();
     uart_service_init();
     health_service_init();
     status_led_service_init();
+    camera_service_init();
+    http_snapshot_service_init();
+    log_memory_status("services_started");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
