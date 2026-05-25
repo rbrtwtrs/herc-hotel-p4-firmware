@@ -305,8 +305,47 @@ void neopixel_handle_cmd(const char *payload) {
         new_b = 0;
         new_w = 255;
         recognized = true;
+    } else if (payload_contains_token_ci(payload, "cyan")) {
+        new_on = true;
+        new_r = 0;
+        new_g = 255;
+        new_b = 255;
+        new_w = 0;
+        recognized = true;
+    } else if (payload_contains_token_ci(payload, "magenta")) {
+        new_on = true;
+        new_r = 255;
+        new_g = 0;
+        new_b = 255;
+        new_w = 0;
+        recognized = true;
+    } else if (payload_contains_token_ci(payload, "yellow")) {
+        new_on = true;
+        new_r = 255;
+        new_g = 255;
+        new_b = 0;
+        new_w = 0;
+        recognized = true;
+    } else if (payload_contains_token_ci(payload, "green")) {
+        new_on = true;
+        new_r = 0;
+        new_g = 255;
+        new_b = 0;
+        new_w = 0;
+        recognized = true;
+    } else if (payload_contains_token_ci(payload, "blue")) {
+        new_on = true;
+        new_r = 0;
+        new_g = 0;
+        new_b = 255;
+        new_w = 0;
+        recognized = true;
     } else if (payload_contains_token_ci(payload, "red")) {
         new_on = true;
+        new_r = 255;
+        new_g = 0;
+        new_b = 0;
+        new_w = 0;
         recognized = true;
     }
 #endif

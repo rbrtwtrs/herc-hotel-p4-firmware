@@ -37,8 +37,9 @@ This document records the known-good state and the remaining operational caveat 
   - 18 LEDs
   - SK6812/GRBW RGBW
   - Default is full-brightness red blink at 2 Hz.
-  - `white` MQTT command sets temporary solid white.
-  - Command brightness can be set with payloads such as `red brightness=32` or `white brightness=32`.
+  - Named MQTT color commands are allowed: `red`, `white`, `green`, `blue`, `cyan`, `magenta`, and `yellow`.
+  - Arbitrary RGB numeric commands remain disabled.
+  - Command brightness can be set with payloads such as `red brightness=32`, `white brightness=32`, or `green brightness=26`.
   - Commands time out after 10 minutes and return to default red blink.
   - Any `/snapshot.jpg` request suppresses the default red blink for 10 minutes by putting the ring in command OFF state.
 
@@ -78,6 +79,14 @@ The network OTA path has been verified without using serial for the update:
   - MQTT health app version: `hotel-ws-snapshotquiet-20260524`.
   - Explicit `/snapshot.jpg` returned `HTTP 200`, `397334` bytes, and published ring state `command`/`OFF` with `timeout_s` about `600`.
   - Explicit ring command `white brightness=32` published ring state `command`/`ON`, RGBW `0,0,0,255`, brightness `32`, with `timeout_s` about `600`.
+- Later OTA update `hotel-ws-ringcolors-20260524` verified the named-color whitelist:
+  - OTA URL: `http://10.1.70.131:8009/herc_hotel_p4.bin`.
+  - Device fetched the image over HTTP and rebooted into `ota_1`.
+  - MQTT health app version: `hotel-ws-ringcolors-20260524`.
+  - `/camera_status` returned `HTTP 200` and ready.
+  - `/snapshot.jpg` returned `HTTP 200` and published ring state `command`/`OFF` with `timeout_s` about `600`.
+  - MQTT ring commands `green brightness=26`, `blue brightness=26`, and `yellow brightness=26` each published the expected RGBW state with `timeout_s` about `600`.
+  - Final `off` command left the ring quiet/off for about 10 minutes.
 
 The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and enables plain HTTP OTA:
 
@@ -88,8 +97,8 @@ The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and e
 
 Verified OTA app artifact:
 
-- App image: `herc_hotel_p4.bin`, SHA256 `9B576A97BDC549422EECB82F0D8DC2B0280DE505A58E8EF07360255DE8EBC516`
-- App size: `1079104` bytes
+- App image: `herc_hotel_p4.bin`, SHA256 `25029B0F10D8271969E24B43A4EEBC4455160EC3D01FF982BE6CA61F3B4E5EC4`
+- App size: `1079760` bytes
 
 For future OTA updates:
 
