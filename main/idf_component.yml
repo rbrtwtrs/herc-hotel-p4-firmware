@@ -1,5 +1,8 @@
 dependencies:
   idf:
-    version: '>=6.0.0'
+    version: '>=5.5.0'
   espressif/mqtt: "*"
-  espressif/ip101: "*"
+  espressif/led_strip: "*"
+  esp_video: "1.4.1"
+  example_video_common:
+    override_path: "../components/example_video_common"

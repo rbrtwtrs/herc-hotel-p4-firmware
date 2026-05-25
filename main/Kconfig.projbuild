@@ -1,0 +1,24 @@
+menu "Hotel Camera Configuration"
+
+    config EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER
+        int "Camera video buffer number"
+        default 2
+
+    config EXAMPLE_JPEG_COMPRESSION_QUALITY
+        int "JPEG compression quality"
+        default 80
+        range 1 100
+
+    config EXAMPLE_HTTP_PART_BOUNDARY
+        string "HTTP part boundary"
+        default "123456789000000000000987654321"
+
+    config EXAMPLE_MDNS_INSTANCE
+        string "mDNS instance"
+        default "herc-hotel-camera"
+
+    config EXAMPLE_MDNS_HOST_NAME
+        string "mDNS host name"
+        default "herc-hotel-p4"
+
+endmenu

@@ -8,16 +8,50 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
+#include "esp_eth_phy.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
-#include "esp_eth_phy_ip101.h"
 
 #include "app_config.h"
 #include "app_state.h"
+#include "camera_video_service.h"
 #include "services.h"
 
 static const char *TAG = "herc_hotel_p4";
 app_state_t g_app = {0};
+static TaskHandle_t s_camera_start_task = NULL;
+
+static void reboot_task(void *arg) {
+    (void)arg;
+    ESP_LOGW(TAG, "Network reboot requested; restarting in 500 ms");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static void request_network_reboot(void) {
+    BaseType_t ok = xTaskCreate(reboot_task, "reboot_task", 2048, NULL, 10, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create reboot task");
+    }
+}
+
+static void camera_start_task(void *arg) {
+    (void)arg;
+    camera_video_service_start();
+    s_camera_start_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void start_camera_service_async(void) {
+    if (s_camera_start_task) {
+        return;
+    }
+    BaseType_t ok = xTaskCreate(camera_start_task, "camera_start", 8192, NULL, 5, &s_camera_start_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create camera_start task");
+    }
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -28,12 +62,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             int status_id = esp_mqtt_client_publish(g_app.mqtt, MQTT_STATUS_TOPIC, "online", 0, 1, 1);
             int debug_id = esp_mqtt_client_publish(g_app.mqtt, MQTT_DEBUG_TOPIC, "boot_connected", 0, 0, 0);
             int sub_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_OTA_TOPIC, 1);
+            int sub_reboot_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_REBOOT_TOPIC, 1);
             int sub_leak_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_LEAK_THRESHOLD_TOPIC, 1);
+            int sub_ring_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_RING_TOPIC, 1);
             mqtt_publish_homeassistant_discovery();
+            neopixel_publish_state();
             ESP_LOGI(TAG, "MQTT publish status msg_id=%d topic=%s", status_id, MQTT_STATUS_TOPIC);
             ESP_LOGI(TAG, "MQTT publish debug msg_id=%d topic=%s", debug_id, MQTT_DEBUG_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_id, MQTT_CMD_OTA_TOPIC);
+            ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_reboot_id, MQTT_CMD_REBOOT_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_leak_id, MQTT_CMD_LEAK_THRESHOLD_TOPIC);
+            ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_ring_id, MQTT_CMD_RING_TOPIC);
             break;
         }
         case MQTT_EVENT_DATA: {
@@ -51,10 +90,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 strncmp(event->topic, MQTT_CMD_OTA_TOPIC, event->topic_len) == 0) {
                 ESP_LOGI(TAG, "OTA command received: %s", data_buf);
                 ota_service_trigger_url(data_buf);
+            } else if (event->topic_len == (int)strlen(MQTT_CMD_REBOOT_TOPIC) &&
+                       strncmp(event->topic, MQTT_CMD_REBOOT_TOPIC, event->topic_len) == 0) {
+                ESP_LOGW(TAG, "Reboot command received: %s", data_buf);
+                request_network_reboot();
             } else if (event->topic_len == (int)strlen(MQTT_CMD_LEAK_THRESHOLD_TOPIC) &&
                        strncmp(event->topic, MQTT_CMD_LEAK_THRESHOLD_TOPIC, event->topic_len) == 0) {
                 ESP_LOGI(TAG, "Leak threshold command received: %s", data_buf);
                 leak_threshold_handle_cmd(data_buf);
+            } else if (event->topic_len == (int)strlen(MQTT_CMD_RING_TOPIC) &&
+                       strncmp(event->topic, MQTT_CMD_RING_TOPIC, event->topic_len) == 0) {
+                ESP_LOGI(TAG, "NeoPixel ring command received: %s", data_buf);
+                neopixel_handle_cmd(data_buf);
             }
             break;
         }
@@ -126,6 +173,7 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t
     ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
 
     start_mqtt();
+    start_camera_service_async();
 }
 
 static void init_ethernet(void) {
@@ -154,6 +202,7 @@ static void init_ethernet(void) {
 
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
+    camera_video_service_pre_net_init();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -166,6 +215,7 @@ void app_main(void) {
     uart_service_init();
     health_service_init();
     status_led_service_init();
+    neopixel_service_init();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

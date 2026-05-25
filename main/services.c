@@ -2,10 +2,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "mqtt_client.h"
@@ -14,6 +17,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
+#include "led_strip.h"
 #include "esp_rom_sys.h"
 
 #include "bme68x.h"
@@ -26,6 +30,321 @@ static struct bme68x_dev s_bme = {0};
 static bool s_bme_ready = false;
 static uint8_t s_bme_addr = 0x77;
 static float s_leak_wet_threshold_v = LEAK_WET_THRESHOLD_V;
+static SemaphoreHandle_t s_ring_mutex = NULL;
+
+typedef struct {
+    bool ready;
+    bool command_active;
+    bool is_on;
+    bool blink_on;
+    uint8_t brightness;
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint8_t white;
+    TickType_t command_expires_at;
+    led_strip_handle_t handle;
+} neopixel_state_t;
+
+static neopixel_state_t s_ring = {
+    .ready = false,
+    .command_active = false,
+    .is_on = false,
+    .blink_on = false,
+    .brightness = NEOPIXEL_DEFAULT_BRIGHTNESS,
+    .red = 255,
+    .green = 0,
+    .blue = 0,
+    .white = 0,
+    .command_expires_at = 0,
+    .handle = NULL,
+};
+
+static uint8_t clamp_u8_int(int value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return (uint8_t)value;
+}
+
+static const char *skip_non_value(const char *p) {
+    while (p && *p && !isdigit((unsigned char)*p) && *p != '-' && *p != '+') {
+        p++;
+    }
+    return p;
+}
+
+static bool parse_int_after_key(const char *payload, const char *key, int *value_out) {
+    if (!payload || !key || !value_out) return false;
+    const char *p = strstr(payload, key);
+    if (!p) return false;
+    p += strlen(key);
+    p = skip_non_value(p);
+    if (!p || !*p) return false;
+
+    char *endptr = NULL;
+    long value = strtol(p, &endptr, 10);
+    if (endptr == p) return false;
+    *value_out = (int)value;
+    return true;
+}
+
+static bool payload_contains_token_ci(const char *payload, const char *token) {
+    if (!payload || !token) return false;
+    size_t token_len = strlen(token);
+    if (token_len == 0) return false;
+    for (const char *p = payload; *p; p++) {
+        size_t i = 0;
+        while (i < token_len && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)token[i])) {
+            i++;
+        }
+        if (i == token_len) return true;
+    }
+    return false;
+}
+
+static esp_err_t neopixel_write_solid_locked(bool on, uint8_t brightness, uint8_t red, uint8_t green, uint8_t blue, uint8_t white) {
+#if NEOPIXEL_ENABLED
+    if (!s_ring.ready || !s_ring.handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!on || brightness == 0) {
+        return led_strip_clear(s_ring.handle);
+    }
+
+    const uint32_t scaled_r = ((uint32_t)red * brightness) / 255u;
+    const uint32_t scaled_g = ((uint32_t)green * brightness) / 255u;
+    const uint32_t scaled_b = ((uint32_t)blue * brightness) / 255u;
+    const uint32_t scaled_w = ((uint32_t)white * brightness) / 255u;
+
+    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+#if NEOPIXEL_RGBW
+        ESP_RETURN_ON_ERROR(led_strip_set_pixel_rgbw(s_ring.handle, i, scaled_r, scaled_g, scaled_b, scaled_w), TAG, "set RGBW pixel %d failed", i);
+#else
+        ESP_RETURN_ON_ERROR(led_strip_set_pixel(s_ring.handle, i, scaled_r, scaled_g, scaled_b), TAG, "set pixel %d failed", i);
+#endif
+    }
+    return led_strip_refresh(s_ring.handle);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static esp_err_t neopixel_apply_locked(void) {
+    return neopixel_write_solid_locked(s_ring.is_on, s_ring.brightness, s_ring.red, s_ring.green, s_ring.blue, s_ring.white);
+}
+
+static void neopixel_publish_state_locked(void) {
+    if (!g_app.mqtt || !g_app.ip_ready) return;
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"mode\":\"%s\",\"state\":\"%s\",\"brightness\":%u,\"color\":{\"r\":%u,\"g\":%u,\"b\":%u,\"w\":%u},\"timeout_s\":%u}",
+             s_ring.command_active ? "command" : "default_red_blink",
+             s_ring.command_active ? (s_ring.is_on ? "ON" : "OFF") : "BLINK",
+             (unsigned)s_ring.brightness,
+             (unsigned)s_ring.red,
+             (unsigned)s_ring.green,
+             (unsigned)s_ring.blue,
+             (unsigned)s_ring.white,
+             s_ring.command_active ? (unsigned)((s_ring.command_expires_at - xTaskGetTickCount()) / configTICK_RATE_HZ) : 0u);
+    esp_mqtt_client_publish(g_app.mqtt, MQTT_RING_STATE_TOPIC, payload, 0, 1, 1);
+}
+
+void neopixel_publish_state(void) {
+    if (!s_ring_mutex) return;
+    if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    neopixel_publish_state_locked();
+    xSemaphoreGive(s_ring_mutex);
+}
+
+static bool neopixel_set_preset(const char *payload, uint8_t *r, uint8_t *g, uint8_t *b) {
+    if (!payload || !r || !g || !b) return false;
+
+    if (payload_contains_token_ci(payload, "warm")) {
+        *r = 255; *g = 180; *b = 90; return true;
+    }
+    if (payload_contains_token_ci(payload, "cool")) {
+        *r = 180; *g = 220; *b = 255; return true;
+    }
+    if (payload_contains_token_ci(payload, "white")) {
+        *r = 255; *g = 255; *b = 255; return true;
+    }
+    if (payload_contains_token_ci(payload, "red")) {
+        *r = 255; *g = 0; *b = 0; return true;
+    }
+    if (payload_contains_token_ci(payload, "green")) {
+        *r = 0; *g = 255; *b = 0; return true;
+    }
+    if (payload_contains_token_ci(payload, "blue")) {
+        *r = 0; *g = 0; *b = 255; return true;
+    }
+
+    return false;
+}
+
+static void neopixel_default_locked(void) {
+    s_ring.command_active = false;
+    s_ring.is_on = false;
+    s_ring.red = 255;
+    s_ring.green = 0;
+    s_ring.blue = 0;
+    s_ring.white = 0;
+    s_ring.brightness = NEOPIXEL_DEFAULT_BRIGHTNESS;
+}
+
+void neopixel_handle_cmd(const char *payload) {
+    if (!payload || !payload[0] || !s_ring_mutex) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGW(TAG, "NeoPixel command dropped: busy");
+        return;
+    }
+
+    if (payload_contains_token_ci(payload, "default") ||
+        payload_contains_token_ci(payload, "auto") ||
+        payload_contains_token_ci(payload, "red_blink")) {
+        neopixel_default_locked();
+        neopixel_publish_state_locked();
+        ESP_LOGI(TAG, "NeoPixel reverted to default red blink by command");
+        xSemaphoreGive(s_ring_mutex);
+        return;
+    }
+
+    bool recognized = false;
+    bool state_set = false;
+    bool new_on = s_ring.command_active ? s_ring.is_on : true;
+    uint8_t new_brightness = s_ring.command_active ? s_ring.brightness : NEOPIXEL_DEFAULT_BRIGHTNESS;
+    uint8_t new_r = 255;
+    uint8_t new_g = 0;
+    uint8_t new_b = 0;
+    uint8_t new_w = 0;
+
+    if (payload_contains_token_ci(payload, "\"state\":\"OFF\"") || payload_contains_token_ci(payload, "off")) {
+        new_on = false;
+        recognized = true;
+        state_set = true;
+    }
+    if (payload_contains_token_ci(payload, "\"state\":\"ON\"") || payload_contains_token_ci(payload, "on")) {
+        new_on = true;
+        recognized = true;
+        state_set = true;
+    }
+
+    int brightness = 0;
+    if (parse_int_after_key(payload, "brightness", &brightness)) {
+        new_brightness = clamp_u8_int(brightness);
+        recognized = true;
+        if (!state_set && new_brightness > 0) {
+            new_on = true;
+        }
+    }
+
+#if NEOPIXEL_ALLOW_COLOR_COMMANDS
+    int r = -1, g = -1, b = -1;
+    if (sscanf(payload, " rgb = %d , %d , %d", &r, &g, &b) == 3 ||
+        sscanf(payload, " %d , %d , %d", &r, &g, &b) == 3) {
+        new_r = clamp_u8_int(r);
+        new_g = clamp_u8_int(g);
+        new_b = clamp_u8_int(b);
+        new_on = true;
+        recognized = true;
+    } else {
+        bool have_r = parse_int_after_key(payload, "\"r\"", &r) || parse_int_after_key(payload, "r=", &r);
+        bool have_g = parse_int_after_key(payload, "\"g\"", &g) || parse_int_after_key(payload, "g=", &g);
+        bool have_b = parse_int_after_key(payload, "\"b\"", &b) || parse_int_after_key(payload, "b=", &b);
+        if (have_r && have_g && have_b) {
+            new_r = clamp_u8_int(r);
+            new_g = clamp_u8_int(g);
+            new_b = clamp_u8_int(b);
+            new_on = true;
+            recognized = true;
+        }
+    }
+
+    if (neopixel_set_preset(payload, &new_r, &new_g, &new_b)) {
+        new_on = true;
+        recognized = true;
+    }
+#else
+    if (payload_contains_token_ci(payload, "white")) {
+        new_on = true;
+        new_r = 0;
+        new_g = 0;
+        new_b = 0;
+        new_w = 255;
+        recognized = true;
+    } else if (payload_contains_token_ci(payload, "red")) {
+        new_on = true;
+        recognized = true;
+    }
+#endif
+
+    if (!recognized) {
+        ESP_LOGW(TAG, "NeoPixel command ignored (unrecognized): %s", payload);
+        xSemaphoreGive(s_ring_mutex);
+        return;
+    }
+
+    s_ring.command_active = true;
+    s_ring.is_on = new_on;
+    s_ring.brightness = new_brightness;
+    s_ring.red = new_r;
+    s_ring.green = new_g;
+    s_ring.blue = new_b;
+    s_ring.white = new_w;
+    s_ring.command_expires_at = xTaskGetTickCount() + pdMS_TO_TICKS(NEOPIXEL_COMMAND_TIMEOUT_MS);
+
+    esp_err_t err = neopixel_apply_locked();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NeoPixel apply failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "NeoPixel command active for %u ms: on=%d brightness=%u rgbw=(%u,%u,%u,%u)",
+                 (unsigned)NEOPIXEL_COMMAND_TIMEOUT_MS,
+                 s_ring.is_on,
+                 (unsigned)s_ring.brightness,
+                 (unsigned)s_ring.red,
+                 (unsigned)s_ring.green,
+                 (unsigned)s_ring.blue,
+                 (unsigned)s_ring.white);
+    }
+
+    neopixel_publish_state_locked();
+    xSemaphoreGive(s_ring_mutex);
+}
+
+static void neopixel_task(void *arg) {
+    (void)arg;
+
+    while (1) {
+        if (s_ring_mutex && xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (s_ring.ready) {
+                TickType_t now = xTaskGetTickCount();
+                if (s_ring.command_active) {
+                    if ((int32_t)(now - s_ring.command_expires_at) >= 0) {
+                        neopixel_default_locked();
+                        neopixel_publish_state_locked();
+                        ESP_LOGI(TAG, "NeoPixel command timeout expired; reverted to default red blink");
+                    }
+                } else {
+                    s_ring.blink_on = !s_ring.blink_on;
+                    esp_err_t err = neopixel_write_solid_locked(
+                        s_ring.blink_on,
+                        NEOPIXEL_DEFAULT_BRIGHTNESS,
+                        255, 0, 0, 0);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "NeoPixel default blink failed: %s", esp_err_to_name(err));
+                    }
+                }
+            }
+            xSemaphoreGive(s_ring_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(NEOPIXEL_DEFAULT_BLINK_HALF_MS));
+    }
+}
 
 static BME68X_INTF_RET_TYPE bme_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
     uint8_t addr = *(uint8_t *)intf_ptr;
@@ -401,6 +720,9 @@ static void health_task(void *arg) {
 static void ota_task(void *arg) {
     char *url = (char *)arg;
     ESP_LOGI(TAG, "Starting OTA from URL: %s", url);
+    if (g_app.mqtt) {
+        esp_mqtt_client_publish(g_app.mqtt, MQTT_OTA_STATE_TOPIC, "started", 0, 1, 1);
+    }
 
     esp_http_client_config_t http_cfg = {
         .url = url,
@@ -415,12 +737,20 @@ static void ota_task(void *arg) {
     esp_err_t err = esp_https_ota(&ota_cfg);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "OTA succeeded, restarting...");
+        if (g_app.mqtt) {
+            esp_mqtt_client_publish(g_app.mqtt, MQTT_OTA_STATE_TOPIC, "success_restarting", 0, 1, 1);
+        }
         free(url);
         esp_restart();
         return;
     }
 
     ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
+    if (g_app.mqtt) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "failed:%s", esp_err_to_name(err));
+        esp_mqtt_client_publish(g_app.mqtt, MQTT_OTA_STATE_TOPIC, msg, 0, 1, 1);
+    }
     free(url);
     vTaskDelete(NULL);
 }
@@ -428,18 +758,27 @@ static void ota_task(void *arg) {
 void ota_service_trigger_url(const char *url) {
     if (!url || !url[0]) {
         ESP_LOGW(TAG, "OTA trigger ignored: empty URL");
+        if (g_app.mqtt) {
+            esp_mqtt_client_publish(g_app.mqtt, MQTT_OTA_STATE_TOPIC, "ignored_empty_url", 0, 1, 1);
+        }
         return;
     }
 
     char *url_copy = strdup(url);
     if (!url_copy) {
         ESP_LOGE(TAG, "OTA trigger failed: out of memory");
+        if (g_app.mqtt) {
+            esp_mqtt_client_publish(g_app.mqtt, MQTT_OTA_STATE_TOPIC, "failed:out_of_memory", 0, 1, 1);
+        }
         return;
     }
 
     BaseType_t ok = xTaskCreate(ota_task, "ota_task", 10240, url_copy, 5, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "OTA task creation failed");
+        if (g_app.mqtt) {
+            esp_mqtt_client_publish(g_app.mqtt, MQTT_OTA_STATE_TOPIC, "failed:task_create", 0, 1, 1);
+        }
         free(url_copy);
     }
 }
@@ -598,4 +937,40 @@ void status_led_service_init(void) {
     ESP_ERROR_CHECK(gpio_config(&io_conf));
     xTaskCreate(status_led_task, "status_led_task", 2048, NULL, 2, NULL);
     ESP_LOGI(TAG, "Status LEDs blinking on GPIO%d and GPIO%d at 1 Hz", STATUS_LED_GPIO, STATUS_LED_GPIO_2);
+}
+
+void neopixel_service_init(void) {
+    if (!s_ring_mutex) {
+        s_ring_mutex = xSemaphoreCreateMutex();
+    }
+
+#if NEOPIXEL_ENABLED
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = NEOPIXEL_GPIO,
+        .max_leds = NEOPIXEL_COUNT,
+        .led_model = LED_MODEL_SK6812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRBW,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+
+    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_ring.handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NeoPixel init failed on GPIO%d: %s", NEOPIXEL_GPIO, esp_err_to_name(err));
+        return;
+    }
+
+    if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
+        s_ring.ready = true;
+        neopixel_default_locked();
+        xSemaphoreGive(s_ring_mutex);
+    }
+
+    xTaskCreate(neopixel_task, "neopixel_task", 4096, NULL, 3, NULL);
+    ESP_LOGI(TAG, "NeoPixel ring defaulting to 2 Hz full-red blink on GPIO%d with %d LEDs", NEOPIXEL_GPIO, NEOPIXEL_COUNT);
+#else
+    ESP_LOGI(TAG, "NeoPixel support disabled at compile time");
+#endif
 }

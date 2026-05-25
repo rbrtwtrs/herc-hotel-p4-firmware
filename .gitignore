@@ -1,7 +1,10 @@
 # ESP-IDF build artifacts
 build/
+build-*/
 managed_components/
 .dependencies.lock
+flash-candidate-*/
+*.bin
 
 # IDE/editor
 .vscode/

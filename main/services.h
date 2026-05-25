@@ -6,5 +6,8 @@ void i2c_service_init(void);
 void uart_service_init(void);
 void health_service_init(void);
 void status_led_service_init(void);
+void neopixel_service_init(void);
+void neopixel_handle_cmd(const char *payload);
+void neopixel_publish_state(void);
 void mqtt_publish_homeassistant_discovery(void);
 void leak_threshold_handle_cmd(const char *payload);
