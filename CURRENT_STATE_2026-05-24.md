@@ -39,7 +39,8 @@ This document records the known-good state and the remaining operational caveat 
   - Default is full-brightness red blink at 2 Hz.
   - `white` MQTT command sets temporary solid white.
   - Command brightness can be set with payloads such as `red brightness=32` or `white brightness=32`.
-  - Commands time out after 60 seconds and return to default red blink.
+  - Commands time out after 10 minutes and return to default red blink.
+  - Any `/snapshot.jpg` request suppresses the default red blink for 10 minutes by putting the ring in command OFF state.
 
 ## MQTT Commands
 
@@ -71,6 +72,12 @@ The network OTA path has been verified without using serial for the update:
 - Post-OTA snapshot check: `HTTP 200`, `382427` bytes.
 - Post-OTA MQTT I2C scan: `0x48`, `0x49`, `0x4A`, `0x4B`, `0x77`.
 - Post-OTA ring state: default red blink, `brightness:255`, RGBW `255,0,0,0`.
+- Later OTA update `hotel-ws-snapshotquiet-20260524` verified the 10-minute ring behavior:
+  - OTA URL: `http://10.1.70.131:8008/herc_hotel_p4.bin`.
+  - Device fetched the image over HTTP and rebooted into `ota_0`.
+  - MQTT health app version: `hotel-ws-snapshotquiet-20260524`.
+  - Explicit `/snapshot.jpg` returned `HTTP 200`, `397334` bytes, and published ring state `command`/`OFF` with `timeout_s` about `600`.
+  - Explicit ring command `white brightness=32` published ring state `command`/`ON`, RGBW `0,0,0,255`, brightness `32`, with `timeout_s` about `600`.
 
 The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and enables plain HTTP OTA:
 

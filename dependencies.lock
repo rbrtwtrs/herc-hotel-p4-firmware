@@ -132,6 +132,16 @@ dependencies:
     - esp32c6
     - esp32c61
     version: 1.4.1
+  espressif/led_strip:
+    component_hash: 28621486f77229aaf81c71f5e15d6fbf36c2949cf11094e07090593e659e7639
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 3.0.3
   espressif/mqtt:
     component_hash: ffdad5659706b4dc14bc63f8eb73ef765efa015bf7e9adf71c813d52a2dc9342
     dependencies:
@@ -184,9 +194,10 @@ dependencies:
 direct_dependencies:
 - espressif/esp_new_jpeg
 - espressif/esp_video
+- espressif/led_strip
 - espressif/mqtt
 - example_video_common
 - idf
-manifest_hash: 7cef3d97bd67047a73d120d8d84b33ad6d96a5a142bb68930d233452c27fe6bf
+manifest_hash: 35384ec3ada424cff46ed59658da7fb9f747b9175d4150856d781f086e18e907
 target: esp32p4
 version: 2.0.0

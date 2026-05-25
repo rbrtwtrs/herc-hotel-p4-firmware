@@ -21,6 +21,7 @@
 #include "linux/videodev2.h"
 
 #include "camera_video_service.h"
+#include "services.h"
 
 #define CAMERA_BUFFER_COUNT CONFIG_EXAMPLE_CAMERA_VIDEO_BUFFER_NUMBER
 #define CAMERA_JPEG_QUALITY CONFIG_EXAMPLE_JPEG_COMPRESSION_QUALITY
@@ -150,6 +151,7 @@ fail:
 
 static esp_err_t snapshot_handler(httpd_req_t *req)
 {
+    neopixel_suppress_default_for_snapshot();
     esp_err_t ret = capture_jpeg(req, &s_camera);
     if (ret != ESP_OK) {
         httpd_resp_set_status(req, "503 Service Unavailable");

@@ -159,6 +159,34 @@ void neopixel_publish_state(void) {
     xSemaphoreGive(s_ring_mutex);
 }
 
+void neopixel_suppress_default_for_snapshot(void) {
+    if (!s_ring_mutex) return;
+    if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGW(TAG, "Snapshot ring suppression dropped: busy");
+        return;
+    }
+
+    s_ring.command_active = true;
+    s_ring.is_on = false;
+    s_ring.red = 255;
+    s_ring.green = 0;
+    s_ring.blue = 0;
+    s_ring.white = 0;
+    s_ring.brightness = NEOPIXEL_DEFAULT_BRIGHTNESS;
+    s_ring.command_expires_at = xTaskGetTickCount() + pdMS_TO_TICKS(NEOPIXEL_SNAPSHOT_SUPPRESS_MS);
+
+    esp_err_t err = neopixel_apply_locked();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Snapshot ring suppression apply failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Snapshot received; suppressing default red blink for %u ms",
+                 (unsigned)NEOPIXEL_SNAPSHOT_SUPPRESS_MS);
+    }
+
+    neopixel_publish_state_locked();
+    xSemaphoreGive(s_ring_mutex);
+}
+
 static bool neopixel_set_preset(const char *payload, uint8_t *r, uint8_t *g, uint8_t *b) {
     if (!payload || !r || !g || !b) return false;
 
