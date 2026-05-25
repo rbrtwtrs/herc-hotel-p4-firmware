@@ -41,7 +41,7 @@ This document records the known-good state and the remaining operational caveat 
   - Arbitrary RGB numeric commands remain disabled.
   - Command brightness can be set with payloads such as `red brightness=32`, `white brightness=32`, or `green brightness=26`.
   - Commands time out after 10 minutes and return to default red blink.
-  - Any `/snapshot.jpg` request suppresses the default red blink for 10 minutes by putting the ring in command OFF state.
+  - Any `/snapshot.jpg` request preserves the current LED ring setting and, if a command is active, resets that command timeout to 10 minutes.
 
 ## MQTT Commands
 
@@ -87,6 +87,15 @@ The network OTA path has been verified without using serial for the update:
   - `/snapshot.jpg` returned `HTTP 200` and published ring state `command`/`OFF` with `timeout_s` about `600`.
   - MQTT ring commands `green brightness=26`, `blue brightness=26`, and `yellow brightness=26` each published the expected RGBW state with `timeout_s` about `600`.
   - Final `off` command left the ring quiet/off for about 10 minutes.
+- Later OTA update `hotel-ws-ringhold-min-20260524` verified snapshot timeout extension without changing the current LED setting:
+  - OTA was triggered with a retained test URL during troubleshooting; command topics were cleared afterward. Do not use retained command messages in normal operation.
+  - MQTT health app version: `hotel-ws-ringhold-min-20260524`.
+  - MQTT health partition: `ota_1`.
+  - MQTT ring command `green brightness=26` published the expected green RGBW state.
+  - `/snapshot.jpg` returned `HTTP 200` and left the ring green while resetting `timeout_s` to about `600`.
+  - MQTT ring command `off` followed by `/snapshot.jpg` left the ring off while resetting `timeout_s` to about `600`.
+  - Final `default` command returned the ring to full-brightness default red blink.
+  - Note: `/camera_status` still reported stale `last_error:"capture_failed:0xb006"` after rapid snapshot testing, but `/snapshot.jpg` returned valid JPEGs and health remained online.
 
 The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and enables plain HTTP OTA:
 
@@ -97,8 +106,8 @@ The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and e
 
 Verified OTA app artifact:
 
-- App image: `herc_hotel_p4.bin`, SHA256 `25029B0F10D8271969E24B43A4EEBC4455160EC3D01FF982BE6CA61F3B4E5EC4`
-- App size: `1079760` bytes
+- App image: `herc_hotel_p4.bin`, SHA256 `5ED80AC0FCD147FD3720550DA9EF4B1D18EC7A0880243941130295A83F6CD576`
+- App size: `1079776` bytes
 
 For future OTA updates:
 
