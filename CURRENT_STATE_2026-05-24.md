@@ -12,6 +12,7 @@ This document records the known-good state and the remaining operational caveat 
 ## Working On The Bench
 
 - Ethernet boot and MQTT connection are working.
+- Network OTA over Ethernet/MQTT is verified from the running firmware. Serial was used once only to recover/install the corrected PSRAM+HTTP-OTA base image.
 - Camera is working with browser endpoints:
   - `http://10.1.70.181/focus`
   - `http://10.1.70.181/snapshot.jpg`
@@ -50,29 +51,46 @@ This document records the known-good state and the remaining operational caveat 
 
 Do not publish retained messages to command topics.
 
-## Important OTA Caveat
+## Verified Network OTA
 
-The unit currently running on the bench was flashed before HTTP OTA was enabled in sdkconfig. It accepts MQTT commands, but a plain `http://.../herc_hotel_p4.bin` OTA URL does not fetch because `CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP` was disabled in that running firmware.
+The network OTA path has been verified without using serial for the update:
 
-This repo state enables HTTP OTA for the next build:
+- Base recovery install: serial flash of `hotel-ws-psram-httpota-base-20260524`, required because the earlier running image did not have PSRAM and HTTP OTA enabled together.
+- OTA verification image: `hotel-ws-ota-netverify-v2-20260524`.
+- OTA command published to `herc-hotel-p4/cmd/ota`: `http://10.1.70.131:8007/herc_hotel_p4.bin`.
+- Device requested the image over HTTP: `GET /herc_hotel_p4.bin`.
+- MQTT OTA state sequence: `started` then `success_restarting`.
+- After reboot, MQTT health reported:
+  - `app_version`: `hotel-ws-ota-netverify-v2-20260`
+  - `partition`: `ota_1`
+- Post-OTA camera status:
+  - `ready`: `true`
+  - `last_error`: `ok`
+  - `capture_errors`: `0`
+  - `free_spiram`: about `27.9 MB`
+- Post-OTA snapshot check: `HTTP 200`, `382427` bytes.
+- Post-OTA MQTT I2C scan: `0x48`, `0x49`, `0x4A`, `0x4B`, `0x77`.
+- Post-OTA ring state: default red blink, `brightness:255`, RGBW `255,0,0,0`.
 
+The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and enables plain HTTP OTA:
+
+- `CONFIG_SPIRAM=y`
+- `CONFIG_SPIRAM_SPEED_200M=y`
 - `CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y`
 - `CONFIG_OTA_ALLOW_HTTP=y`
 
-The patched source was build-verified locally as `hotel-ws-httpota-fullred-20260524` with ESP-IDF `v5.5.2`.
+Verified OTA app artifact:
 
-- App image: `herc_hotel_p4.bin`, SHA256 `A0485BC5B9D88F85BEE9C724DF1D06F675E0C243A164222BC9227739FAD9FAEE`
-- Bootloader: `bootloader.bin`, SHA256 `F9EB0F92F7C6EDA4F0122BAD1E93730DC566D3CA07C0FF6CBE576B8DEDA2A09D`
-- Partition table: `partition-table.bin`, SHA256 `F1E567915E11BC9C49E65FE894F631FF59EF8C971DA2AEE4437BB8E70A262300`
-- App size: `0x104250`
-- Smallest OTA app partition: `0x700000`
+- App image: `herc_hotel_p4.bin`, SHA256 `9B576A97BDC549422EECB82F0D8DC2B0280DE505A58E8EF07360255DE8EBC516`
+- App size: `1079104` bytes
 
-One physical flash of this repo state is required before Ethernet HTTP OTA can be honestly called verified. After that flash, OTA should be validated using MQTT only, with no serial dependency:
+For future OTA updates:
 
-1. Serve `build/herc_hotel_p4.bin` from a reachable HTTP server.
-2. Publish the URL to `herc-hotel-p4/cmd/ota`.
-3. Watch `herc-hotel-p4/ota/state` for `started` and `success_restarting`.
-4. Verify reboot, `herc-hotel-p4/status online`, `http://10.1.70.181/camera_status`, and `http://10.1.70.181/snapshot.jpg`.
+1. Build with the repo default `sdkconfig`.
+2. Serve `build/herc_hotel_p4.bin` from a reachable HTTP server.
+3. Publish the URL to `herc-hotel-p4/cmd/ota` with `retain=false`.
+4. Watch `herc-hotel-p4/ota/state` for `started` and `success_restarting`.
+5. Verify reboot, `herc-hotel-p4/status online`, `herc-hotel-p4/health` app version/partition, `http://10.1.70.181/camera_status`, and `http://10.1.70.181/snapshot.jpg`.
 
 ## Known Boundaries
 

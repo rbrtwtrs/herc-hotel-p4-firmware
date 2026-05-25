@@ -706,10 +706,15 @@ void mqtt_publish_homeassistant_discovery(void) {
 static void health_task(void *arg) {
     while (1) {
         if (g_app.mqtt && g_app.ip_ready) {
-            char payload[96];
-            snprintf(payload, sizeof(payload), "{\"uptime_s\":%lu,\"heap\":%lu}",
+            const esp_app_desc_t *app = esp_app_get_description();
+            const esp_partition_t *running = esp_ota_get_running_partition();
+            char payload[192];
+            snprintf(payload, sizeof(payload),
+                     "{\"uptime_s\":%lu,\"heap\":%lu,\"app_version\":\"%s\",\"partition\":\"%s\"}",
                      (unsigned long)(esp_log_timestamp() / 1000),
-                     (unsigned long)esp_get_free_heap_size());
+                     (unsigned long)esp_get_free_heap_size(),
+                     app ? app->version : "unknown",
+                     running ? running->label : "unknown");
             int msg_id = esp_mqtt_client_publish(g_app.mqtt, MQTT_HEALTH_TOPIC, payload, 0, 0, 0);
             ESP_LOGI(TAG, "MQTT publish health msg_id=%d topic=%s payload=%s", msg_id, MQTT_HEALTH_TOPIC, payload);
         }
