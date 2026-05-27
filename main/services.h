@@ -12,3 +12,5 @@ void neopixel_publish_state(void);
 void neopixel_suppress_default_for_snapshot(void);
 void mqtt_publish_homeassistant_discovery(void);
 void leak_threshold_handle_cmd(const char *payload);
+void telemetry_mode_handle_cmd(const char *payload);
+void telemetry_mode_publish_state(void);

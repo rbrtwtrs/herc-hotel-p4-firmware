@@ -30,7 +30,17 @@ static struct bme68x_dev s_bme = {0};
 static bool s_bme_ready = false;
 static uint8_t s_bme_addr = 0x77;
 static float s_leak_wet_threshold_v = LEAK_WET_THRESHOLD_V;
+static float s_motor_temp_offset_c = 0.93f;
+static float s_motor_temp_last_raw_c = 0.0f;
+static bool s_motor_temp_last_raw_valid = false;
 static SemaphoreHandle_t s_ring_mutex = NULL;
+
+typedef enum {
+    TELEMETRY_MODE_SIMPLE = 0,
+    TELEMETRY_MODE_VERBOSE = 1,
+} telemetry_mode_t;
+
+static telemetry_mode_t s_telemetry_mode = TELEMETRY_MODE_SIMPLE;
 
 typedef struct {
     bool ready;
@@ -45,6 +55,81 @@ typedef struct {
     TickType_t command_expires_at;
     led_strip_handle_t handle;
 } neopixel_state_t;
+
+#define ADS1115_FULL_SCALE_V 4.096f
+#define ADS1115_RAW_SCALE 32768.0f
+#define MOTOR_TEMP_SENSE_RESISTOR_OHMS 2700.0f
+#define PRESSURE_SENSOR_FULL_SCALE_V 5.0f
+#define PRESSURE_SENSOR_FULL_SCALE_PSI 6000.0f
+#define MAIN_PRESSURE_CAL_POINT_COUNT 6
+#define RES_LEVEL_DEFAULT_ZERO_V 1.0f
+#define RES_LEVEL_DEFAULT_FULL_V 5.0f
+
+typedef struct {
+    uint8_t channel;
+    const char *key;
+    const char *name;
+} ads_named_channel_t;
+
+typedef struct {
+    float zero_v;
+    float full_v;
+    float last_v;
+    bool last_valid;
+} res_level_cal_t;
+
+typedef struct {
+    float psi;
+    float volts;
+} pressure_cal_point_t;
+
+static res_level_cal_t s_res_level_cal[4] = {
+    {.zero_v = 1.033f, .full_v = RES_LEVEL_DEFAULT_FULL_V},
+    {.zero_v = 1.032f, .full_v = RES_LEVEL_DEFAULT_FULL_V},
+    {.zero_v = RES_LEVEL_DEFAULT_ZERO_V, .full_v = RES_LEVEL_DEFAULT_FULL_V},
+    {.zero_v = RES_LEVEL_DEFAULT_ZERO_V, .full_v = RES_LEVEL_DEFAULT_FULL_V},
+};
+
+static const pressure_cal_point_t s_main_pressure_cal[MAIN_PRESSURE_CAL_POINT_COUNT] = {
+    {.psi = 0.0f, .volts = 0.000f},
+    {.psi = 1000.0f, .volts = 1.765f},
+    {.psi = 1500.0f, .volts = 2.120f},
+    {.psi = 2000.0f, .volts = 2.497f},
+    {.psi = 2500.0f, .volts = 2.888f},
+    {.psi = 3000.0f, .volts = 3.281f},
+};
+
+static const ads_named_channel_t s_leak_channels[] = {
+    {0, "kraft", "Kraft Leak"},
+    {1, "chassis", "Chassis Leak"},
+    {2, "xformer", "Xformer Leak"},
+    {3, "j_boxes", "J-Boxes Leak"},
+};
+
+static const ads_named_channel_t s_res_level_channels[] = {
+    {0, "res_level_1", "Res Level 1"},
+    {1, "res_level_2", "Res Level 2"},
+    {2, "res_level_3", "Res Level 3"},
+    {3, "res_level_4", "Res Level 4"},
+};
+
+static const ads_named_channel_t s_res_level_simple_aliases[] = {
+    {0, "hydralic_comp", "Hydralic Comp"},
+    {1, "elec_comp", "Elec Comp"},
+};
+
+static const ads_named_channel_t s_pressure_channels[] = {
+    {0, "main_hyd_press", "Main Hyd Press"},
+    {1, "aux_press_1", "Aux Press 1"},
+    {2, "aux_press_2", "Aux Press 2"},
+    {3, "aux_press_3", "Aux Press 3"},
+};
+
+static const ads_named_channel_t s_bender_channels[] = {
+    {0, "herc_bender_ac_a", "Herc Bender AC A"},
+    {1, "herc_bender_ac_b", "Herc Bender AC B"},
+    {2, "herc_bender_48vdc", "Herc Bender 48VDC"},
+};
 
 static neopixel_state_t s_ring = {
     .ready = false,
@@ -596,9 +681,107 @@ static esp_err_t ads1115_read_channel(uint8_t addr, uint8_t channel, int16_t *ra
     return ESP_OK;
 }
 
+static float ads1115_raw_to_volts(int16_t raw) {
+    return ((float)raw) * ADS1115_FULL_SCALE_V / ADS1115_RAW_SCALE;
+}
+
+static int motor_temp_volts_to_centi_c(float volts) {
+    float raw_c = ((volts * 1000000.0f) / MOTOR_TEMP_SENSE_RESISTOR_OHMS) - 273.15f;
+    s_motor_temp_last_raw_c = raw_c;
+    s_motor_temp_last_raw_valid = true;
+    float temp_c = raw_c + s_motor_temp_offset_c;
+    return (int)(temp_c * 100.0f + (temp_c >= 0.0f ? 0.5f : -0.5f));
+}
+
+static int res_level_volts_to_percent_int(uint8_t channel, float volts) {
+    if (channel > 3) return 0;
+    float span = s_res_level_cal[channel].full_v - s_res_level_cal[channel].zero_v;
+    if (span < 0.05f) span = RES_LEVEL_DEFAULT_FULL_V - RES_LEVEL_DEFAULT_ZERO_V;
+    float pct = ((volts - s_res_level_cal[channel].zero_v) / span) * 100.0f;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    return (int)(pct + 0.5f);
+}
+
+static int volts_to_psi_int(float volts) {
+    float psi = (volts / PRESSURE_SENSOR_FULL_SCALE_V) * PRESSURE_SENSOR_FULL_SCALE_PSI;
+    if (psi < 0.0f) psi = 0.0f;
+    if (psi > PRESSURE_SENSOR_FULL_SCALE_PSI) psi = PRESSURE_SENSOR_FULL_SCALE_PSI;
+    return (int)(psi + 0.5f);
+}
+
+static int main_pressure_volts_to_psi_int(float volts) {
+    float psi = 0.0f;
+
+    if (volts <= s_main_pressure_cal[0].volts) {
+        psi = s_main_pressure_cal[0].psi;
+    } else if (volts >= s_main_pressure_cal[MAIN_PRESSURE_CAL_POINT_COUNT - 1].volts) {
+        psi = s_main_pressure_cal[MAIN_PRESSURE_CAL_POINT_COUNT - 1].psi;
+    } else {
+        for (int i = 0; i < MAIN_PRESSURE_CAL_POINT_COUNT - 1; i++) {
+            const pressure_cal_point_t *lo = &s_main_pressure_cal[i];
+            const pressure_cal_point_t *hi = &s_main_pressure_cal[i + 1];
+            if (volts >= lo->volts && volts <= hi->volts) {
+                float span_v = hi->volts - lo->volts;
+                float frac = span_v > 0.001f ? (volts - lo->volts) / span_v : 0.0f;
+                psi = lo->psi + frac * (hi->psi - lo->psi);
+                break;
+            }
+        }
+    }
+
+    if (psi < 0.0f) psi = 0.0f;
+    if (psi > 3000.0f) psi = 3000.0f;
+    return (int)(psi + 0.5f);
+}
+
+static void motor_temp_publish_offset(void) {
+    if (!g_app.mqtt || !g_app.ip_ready) return;
+
+    char payload[96];
+    if (s_motor_temp_last_raw_valid) {
+        snprintf(payload, sizeof(payload), "{\"offset_c\":%.2f,\"last_raw_c\":%.2f}",
+                 (double)s_motor_temp_offset_c, (double)s_motor_temp_last_raw_c);
+    } else {
+        snprintf(payload, sizeof(payload), "{\"offset_c\":%.2f,\"last_raw_c\":null}",
+                 (double)s_motor_temp_offset_c);
+    }
+    esp_mqtt_client_publish(g_app.mqtt, MQTT_MOTOR_TEMP_OFFSET_TOPIC, payload, 0, 1, 1);
+}
+
+static const char *telemetry_mode_name(void) {
+    return s_telemetry_mode == TELEMETRY_MODE_VERBOSE ? "verbose" : "simple";
+}
+
+void telemetry_mode_publish_state(void) {
+    if (!g_app.mqtt || !g_app.ip_ready) return;
+
+    char payload[96];
+    snprintf(payload, sizeof(payload), "{\"mode\":\"%s\"}", telemetry_mode_name());
+    esp_mqtt_client_publish(g_app.mqtt, MQTT_TELEMETRY_MODE_TOPIC, payload, 0, 1, 1);
+}
+
+void telemetry_mode_handle_cmd(const char *payload) {
+    if (!payload || !payload[0]) return;
+
+    if (payload_contains_token_ci(payload, "verbose")) {
+        s_telemetry_mode = TELEMETRY_MODE_VERBOSE;
+    } else if (payload_contains_token_ci(payload, "simple")) {
+        s_telemetry_mode = TELEMETRY_MODE_SIMPLE;
+    } else {
+        ESP_LOGW(TAG, "Telemetry mode command ignored (unrecognized): %s", payload);
+        telemetry_mode_publish_state();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Telemetry mode set to %s", telemetry_mode_name());
+    telemetry_mode_publish_state();
+}
+
 static void i2c_publish_task(void *arg) {
     while (1) {
         if (g_app.mqtt && g_app.ip_ready && s_i2c_bus) {
+            const bool verbose = (s_telemetry_mode == TELEMETRY_MODE_VERBOSE);
             char scan_payload[256] = {0};
             size_t used = 0;
             used += snprintf(scan_payload + used, sizeof(scan_payload) - used, "{\"found\":[");
@@ -615,20 +798,115 @@ static void i2c_publish_task(void *arg) {
                     for (uint8_t ch = 0; ch < 4; ch++) {
                         int16_t raw = 0;
                         if (ads1115_read_channel(addr, ch, &raw) == ESP_OK) {
-                            float volts = ((float)raw) * 4.096f / 32768.0f;
+                            float volts = ads1115_raw_to_volts(raw);
                             char topic[96];
-                            char payload[96];
-                            snprintf(topic, sizeof(topic), "%s/ads1115/0x%02X/ch%u", MQTT_I2C_TOPIC_PREFIX, addr, ch);
-                            snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f}", raw, (double)volts);
-                            esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                            char payload[192];
 
-                            if (addr == 0x49) {
-                                const char *state = (volts < s_leak_wet_threshold_v) ? "WET" : "DRY";
-                                char leak_topic[96];
-                                char leak_payload[96];
-                                snprintf(leak_topic, sizeof(leak_topic), "%s/zone%u", MQTT_LEAK_TOPIC_PREFIX, (unsigned)(ch + 1));
-                                snprintf(leak_payload, sizeof(leak_payload), "{\"state\":\"%s\",\"volts\":%.5f,\"raw\":%d}", state, (double)volts, raw);
-                                esp_mqtt_client_publish(g_app.mqtt, leak_topic, leak_payload, 0, 0, 0);
+                            if (verbose) {
+                                snprintf(topic, sizeof(topic), "%s/ads1115/0x%02X/ch%u", MQTT_I2C_TOPIC_PREFIX, addr, ch);
+
+                                if (addr == 0x48 && ch == 0) {
+                                    int temp_centi_c = motor_temp_volts_to_centi_c(volts);
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"temperature_c\":%.2f,\"raw_temperature_c\":%.2f,\"offset_c\":%.2f}",
+                                             raw, (double)volts, (double)temp_centi_c / 100.0,
+                                             (double)s_motor_temp_last_raw_c, (double)s_motor_temp_offset_c);
+                                } else if (addr == 0x49) {
+                                    const char *state = (volts <= s_leak_wet_threshold_v) ? "WET" : "DRY";
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"state\":\"%s\"}",
+                                             raw, (double)volts, state);
+                                } else if (addr == 0x4A) {
+                                    int pct = res_level_volts_to_percent_int(ch, volts);
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"percent\":%d,\"zero_v\":%.3f,\"full_v\":%.3f}",
+                                             raw, (double)volts, pct, (double)s_res_level_cal[ch].zero_v,
+                                             (double)s_res_level_cal[ch].full_v);
+                                } else if (addr == 0x4B) {
+                                    int psi = (ch == 0) ? main_pressure_volts_to_psi_int(volts) : volts_to_psi_int(volts);
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"psi\":%d%s}",
+                                             raw, (double)volts, psi, ch == 0 ? ",\"calibrated\":true" : "");
+                                } else {
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f}", raw, (double)volts);
+                                }
+                                esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                            }
+
+                            if (addr == 0x48 && ch == 0) {
+                                int temp_centi_c = motor_temp_volts_to_centi_c(volts);
+                                snprintf(topic, sizeof(topic), "%s/motor_temperature", MQTT_I2C_TOPIC_PREFIX);
+                                if (verbose) {
+                                    snprintf(payload, sizeof(payload), "{\"temperature_c\":%.2f,\"raw_temperature_c\":%.2f,\"offset_c\":%.2f,\"volts\":%.5f,\"raw\":%d}",
+                                             (double)temp_centi_c / 100.0, (double)s_motor_temp_last_raw_c,
+                                             (double)s_motor_temp_offset_c, (double)volts, raw);
+                                } else {
+                                    snprintf(payload, sizeof(payload), "{\"temperature_c\":%.2f}", (double)temp_centi_c / 100.0);
+                                }
+                                esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                            } else if (addr == 0x49) {
+                                const char *state = (volts <= s_leak_wet_threshold_v) ? "WET" : "DRY";
+                                if (verbose) {
+                                    snprintf(topic, sizeof(topic), "%s/zone%u", MQTT_LEAK_TOPIC_PREFIX, (unsigned)(ch + 1));
+                                    snprintf(payload, sizeof(payload), "{\"state\":\"%s\",\"volts\":%.5f,\"raw\":%d}", state, (double)volts, raw);
+                                    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                }
+
+                                for (size_t i = 0; i < sizeof(s_leak_channels) / sizeof(s_leak_channels[0]); i++) {
+                                    if (s_leak_channels[i].channel != ch) continue;
+                                    snprintf(topic, sizeof(topic), "%s/%s", MQTT_LEAK_TOPIC_PREFIX, s_leak_channels[i].key);
+                                    if (verbose) {
+                                        snprintf(payload, sizeof(payload), "{\"state\":\"%s\",\"volts\":%.5f,\"raw\":%d}",
+                                                 state, (double)volts, raw);
+                                    } else {
+                                        snprintf(payload, sizeof(payload), "{\"state\":\"%s\"}", state);
+                                    }
+                                    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+
+                                    snprintf(topic, sizeof(topic), "%s/%s_volts", MQTT_LEAK_TOPIC_PREFIX, s_leak_channels[i].key);
+                                    if (verbose) {
+                                        snprintf(payload, sizeof(payload), "{\"volts\":%.5f,\"raw\":%d}", (double)volts, raw);
+                                    } else {
+                                        snprintf(payload, sizeof(payload), "{\"volts\":%.5f}", (double)volts);
+                                    }
+                                    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                    break;
+                                }
+                            } else if (addr == 0x4A) {
+                                s_res_level_cal[ch].last_v = volts;
+                                s_res_level_cal[ch].last_valid = true;
+                                int pct = res_level_volts_to_percent_int(ch, volts);
+                                if (verbose) {
+                                    for (size_t i = 0; i < sizeof(s_res_level_channels) / sizeof(s_res_level_channels[0]); i++) {
+                                        if (s_res_level_channels[i].channel != ch) continue;
+                                        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_channels[i].key);
+                                        snprintf(payload, sizeof(payload), "{\"percent\":%d,\"volts\":%.5f,\"raw\":%d,\"zero_v\":%.3f,\"full_v\":%.3f}",
+                                                 pct, (double)volts, raw, (double)s_res_level_cal[ch].zero_v,
+                                                 (double)s_res_level_cal[ch].full_v);
+                                        esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                        break;
+                                    }
+                                }
+
+                                if (!verbose) {
+                                    for (size_t i = 0; i < sizeof(s_res_level_simple_aliases) / sizeof(s_res_level_simple_aliases[0]); i++) {
+                                        if (s_res_level_simple_aliases[i].channel != ch) continue;
+                                        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_simple_aliases[i].key);
+                                        snprintf(payload, sizeof(payload), "{\"percent\":%d}", pct);
+                                        esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                        break;
+                                    }
+                                }
+                            } else if (addr == 0x4B) {
+                                int psi = (ch == 0) ? main_pressure_volts_to_psi_int(volts) : volts_to_psi_int(volts);
+                                for (size_t i = 0; i < sizeof(s_pressure_channels) / sizeof(s_pressure_channels[0]); i++) {
+                                    if (s_pressure_channels[i].channel != ch) continue;
+                                    snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_pressure_channels[i].key);
+                                    if (verbose) {
+                                        snprintf(payload, sizeof(payload), "{\"psi\":%d,\"volts\":%.5f,\"raw\":%d%s}",
+                                                 psi, (double)volts, raw, ch == 0 ? ",\"calibrated\":true" : "");
+                                    } else {
+                                        snprintf(payload, sizeof(payload), "{\"psi\":%d}", psi);
+                                    }
+                                    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -636,8 +914,10 @@ static void i2c_publish_task(void *arg) {
             }
 
             snprintf(scan_payload + used, sizeof(scan_payload) - used, "]}");
-            esp_mqtt_client_publish(g_app.mqtt, MQTT_I2C_SCAN_TOPIC, scan_payload, 0, 0, 0);
-            ESP_LOGI(TAG, "I2C scan published: %s", scan_payload);
+            if (verbose) {
+                esp_mqtt_client_publish(g_app.mqtt, MQTT_I2C_SCAN_TOPIC, scan_payload, 0, 0, 0);
+                ESP_LOGI(TAG, "I2C scan published: %s", scan_payload);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(15000));
@@ -691,6 +971,7 @@ static void mqtt_publish_ha_binary(const char *obj_id, const char *name, const c
              "{\"name\":\"%s\",\"state_topic\":\"%s\",\"availability_topic\":\"%s\","
              "\"payload_available\":\"online\",\"payload_not_available\":\"offline\","
              "\"payload_on\":\"%s\",\"payload_off\":\"%s\","
+             "\"value_template\":\"{{ value_json.state }}\","
              "\"unique_id\":\"%s\",\"device_class\":\"%s\","
              "\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"manufacturer\":\"Waveshare\",\"model\":\"ESP32-P4-Nano\"}}",
              name, state_topic, MQTT_STATUS_TOPIC, payload_on, payload_off,
@@ -711,42 +992,76 @@ void mqtt_publish_homeassistant_discovery(void) {
     mqtt_publish_ha_sensor("sensor", "herc_hotel_p4_bme_gas", "Herc Hotel Gas", MQTT_BME_TOPIC_PREFIX,
                            "Ω", NULL, "{{ value_json.gas_ohm }}");
 
-    // ADS1115 channels
-    for (int addr = 0x48; addr <= 0x4B; addr++) {
-        for (int ch = 0; ch < 4; ch++) {
-            char topic[96], obj_id[64], name[96], vt[64];
-            snprintf(topic, sizeof(topic), "%s/ads1115/0x%02X/ch%d", MQTT_I2C_TOPIC_PREFIX, addr, ch);
-            snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_ads_0x%02X_ch%d", addr, ch);
-            if (addr == 0x49) {
-                snprintf(name, sizeof(name), "Leak Zone %d Voltage", ch + 1);
-            } else {
-                snprintf(name, sizeof(name), "ADS1115 0x%02X CH%d", addr, ch);
-            }
-            snprintf(vt, sizeof(vt), "{{ value_json.volts }}");
-            mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "V", "voltage", vt);
-        }
-    }
+    // ADS1115 functional channels
+    mqtt_publish_ha_sensor("sensor", "herc_hotel_p4_motor_temperature", "Motor Temperature",
+                           MQTT_I2C_TOPIC_PREFIX "/motor_temperature", "C", "temperature", "{{ value_json.temperature_c }}");
+    mqtt_publish_ha_sensor("sensor", "herc_hotel_p4_motor_temperature_voltage", "Motor Temperature Voltage",
+                           MQTT_I2C_TOPIC_PREFIX "/motor_temperature", "V", "voltage", "{{ value_json.volts }}");
+    mqtt_publish_ha_sensor("sensor", "herc_hotel_p4_motor_temperature_offset", "Motor Temperature Offset",
+                           MQTT_MOTOR_TEMP_OFFSET_TOPIC, "C", "temperature", "{{ value_json.offset_c }}");
 
-    // Leak zones (0x49 + pull-up bank)
-    for (int zone = 1; zone <= 4; zone++) {
-        char topic[96], obj_id[64], name[96], vt[64];
-        snprintf(topic, sizeof(topic), "%s/zone%d", MQTT_LEAK_TOPIC_PREFIX, zone);
-        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_leak_zone_%d", zone);
-        snprintf(name, sizeof(name), "Leak Zone %d", zone);
+    for (size_t i = 0; i < sizeof(s_leak_channels) / sizeof(s_leak_channels[0]); i++) {
+        char topic[128], obj_id[96], name[128], vt[64];
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_LEAK_TOPIC_PREFIX, s_leak_channels[i].key);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s", s_leak_channels[i].key);
+        snprintf(name, sizeof(name), "%s", s_leak_channels[i].name);
         mqtt_publish_ha_binary(obj_id, name, topic, "moisture", "WET", "DRY");
 
-        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_leak_zone_%d_state", zone);
-        snprintf(name, sizeof(name), "Leak Zone %d State", zone);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s_state", s_leak_channels[i].key);
+        snprintf(name, sizeof(name), "%s State", s_leak_channels[i].name);
         snprintf(vt, sizeof(vt), "{{ value_json.state }}");
         mqtt_publish_ha_sensor("sensor", obj_id, name, topic, NULL, NULL, vt);
+
+        snprintf(topic, sizeof(topic), "%s/%s_volts", MQTT_LEAK_TOPIC_PREFIX, s_leak_channels[i].key);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s_voltage", s_leak_channels[i].key);
+        snprintf(name, sizeof(name), "%s Voltage", s_leak_channels[i].name);
+        snprintf(vt, sizeof(vt), "{{ value_json.volts }}");
+        mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "V", "voltage", vt);
+    }
+
+    for (size_t i = 0; i < sizeof(s_res_level_channels) / sizeof(s_res_level_channels[0]); i++) {
+        char topic[128], obj_id[96], name[128], vt[64];
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_channels[i].key);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s", s_res_level_channels[i].key);
+        snprintf(name, sizeof(name), "%s", s_res_level_channels[i].name);
+        snprintf(vt, sizeof(vt), "{{ value_json.percent }}");
+        mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "%", NULL, vt);
+
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s_voltage", s_res_level_channels[i].key);
+        snprintf(name, sizeof(name), "%s Voltage", s_res_level_channels[i].name);
+        snprintf(vt, sizeof(vt), "{{ value_json.volts }}");
+        mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "V", "voltage", vt);
+    }
+
+    for (size_t i = 0; i < sizeof(s_res_level_simple_aliases) / sizeof(s_res_level_simple_aliases[0]); i++) {
+        char topic[128], obj_id[96], name[128], vt[64];
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_simple_aliases[i].key);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s", s_res_level_simple_aliases[i].key);
+        snprintf(name, sizeof(name), "%s", s_res_level_simple_aliases[i].name);
+        snprintf(vt, sizeof(vt), "{{ value_json.percent }}");
+        mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "%", NULL, vt);
+    }
+
+    for (size_t i = 0; i < sizeof(s_pressure_channels) / sizeof(s_pressure_channels[0]); i++) {
+        char topic[128], obj_id[96], name[128], vt[64];
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_pressure_channels[i].key);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s", s_pressure_channels[i].key);
+        snprintf(name, sizeof(name), "%s", s_pressure_channels[i].name);
+        snprintf(vt, sizeof(vt), "{{ value_json.psi }}");
+        mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "psi", "pressure", vt);
+
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s_voltage", s_pressure_channels[i].key);
+        snprintf(name, sizeof(name), "%s Voltage", s_pressure_channels[i].name);
+        snprintf(vt, sizeof(vt), "{{ value_json.volts }}");
+        mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "V", "voltage", vt);
     }
 
     // Bender channels
-    for (int id = 0; id < 3; id++) {
+    for (size_t i = 0; i < sizeof(s_bender_channels) / sizeof(s_bender_channels[0]); i++) {
         char topic[96], obj_id[64], name[96], vt[96];
-        snprintf(topic, sizeof(topic), "%s/%d", MQTT_BENDER_TOPIC_PREFIX, id);
-        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_bender_%d", id);
-        snprintf(name, sizeof(name), "Bender %d Resistance", id);
+        snprintf(topic, sizeof(topic), "%s/%s", MQTT_BENDER_TOPIC_PREFIX, s_bender_channels[i].key);
+        snprintf(obj_id, sizeof(obj_id), "herc_hotel_p4_%s", s_bender_channels[i].key);
+        snprintf(name, sizeof(name), "%s Resistance", s_bender_channels[i].name);
         snprintf(vt, sizeof(vt), "{{ value_json.resistance_kohm }}");
         mqtt_publish_ha_sensor("sensor", obj_id, name, topic, "kΩ", NULL, vt);
     }
@@ -757,6 +1072,7 @@ void mqtt_publish_homeassistant_discovery(void) {
         snprintf(payload, sizeof(payload), "{\"wet_below_v\":%.3f}", (double)s_leak_wet_threshold_v);
         esp_mqtt_client_publish(g_app.mqtt, MQTT_LEAK_THRESHOLD_TOPIC, payload, 0, 1, 1);
     }
+    motor_temp_publish_offset();
 
     ESP_LOGI(TAG, "Home Assistant MQTT discovery published");
 }
@@ -932,12 +1248,30 @@ static void bender_process_line(const char *line) {
         float resistance = (float)atof(parts[6]);
 
         if (g_app.mqtt && g_app.ip_ready) {
+            const bool verbose = (s_telemetry_mode == TELEMETRY_MODE_VERBOSE);
             char topic[96];
-            char payload[128];
-            snprintf(topic, sizeof(topic), "%s/%d", MQTT_BENDER_TOPIC_PREFIX, bender_id);
-            snprintf(payload, sizeof(payload), "{\"status\":%.0f,\"resistance_kohm\":%.2f,\"raw\":\"%s\"}",
-                     (double)status, (double)resistance, line);
-            esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+            char payload[160];
+
+            for (size_t i = 0; i < sizeof(s_bender_channels) / sizeof(s_bender_channels[0]); i++) {
+                if (s_bender_channels[i].channel != bender_id) continue;
+                snprintf(topic, sizeof(topic), "%s/%s", MQTT_BENDER_TOPIC_PREFIX, s_bender_channels[i].key);
+                if (verbose) {
+                    snprintf(payload, sizeof(payload), "{\"status\":%.0f,\"resistance_kohm\":%.2f,\"raw\":\"%s\"}",
+                             (double)status, (double)resistance, line);
+                } else {
+                    snprintf(payload, sizeof(payload), "{\"status\":%.0f,\"resistance_kohm\":%.2f}",
+                             (double)status, (double)resistance);
+                }
+                esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                break;
+            }
+
+            if (verbose) {
+                snprintf(topic, sizeof(topic), "%s/%d", MQTT_BENDER_TOPIC_PREFIX, bender_id);
+                snprintf(payload, sizeof(payload), "{\"status\":%.0f,\"resistance_kohm\":%.2f,\"raw\":\"%s\"}",
+                         (double)status, (double)resistance, line);
+                esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+            }
         }
     }
 }
