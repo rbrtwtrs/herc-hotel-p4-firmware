@@ -11,6 +11,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "nvs.h"
 #include "mqtt_client.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
@@ -55,6 +56,11 @@ typedef struct {
     TickType_t command_expires_at;
     led_strip_handle_t handle;
 } neopixel_state_t;
+
+typedef enum {
+    NEOPIXEL_DEFAULT_RED_BLINK = 0,
+    NEOPIXEL_DEFAULT_STEADY_WHITE = 1,
+} neopixel_default_mode_t;
 
 #define ADS1115_FULL_SCALE_V 4.096f
 #define ADS1115_RAW_SCALE 32768.0f
@@ -144,6 +150,12 @@ static neopixel_state_t s_ring = {
     .command_expires_at = 0,
     .handle = NULL,
 };
+static neopixel_default_mode_t s_ring_default_mode = NEOPIXEL_DEFAULT_RED_BLINK;
+static uint8_t s_ring_default_white_brightness = 100;
+
+static const char *neopixel_default_mode_name(void) {
+    return s_ring_default_mode == NEOPIXEL_DEFAULT_STEADY_WHITE ? "steady_white" : "red_blink";
+}
 
 static uint8_t clamp_u8_int(int value) {
     if (value < 0) return 0;
@@ -226,8 +238,9 @@ static void neopixel_publish_state_locked(void) {
     char payload[256];
     snprintf(payload, sizeof(payload),
              "{\"mode\":\"%s\",\"state\":\"%s\",\"brightness\":%u,\"color\":{\"r\":%u,\"g\":%u,\"b\":%u,\"w\":%u},\"timeout_s\":%u}",
-             s_ring.command_active ? "command" : "default_red_blink",
-             s_ring.command_active ? (s_ring.is_on ? "ON" : "OFF") : "BLINK",
+             s_ring.command_active ? "command" : neopixel_default_mode_name(),
+             s_ring.command_active ? (s_ring.is_on ? "ON" : "OFF") :
+                 (s_ring_default_mode == NEOPIXEL_DEFAULT_STEADY_WHITE ? "ON" : "BLINK"),
              (unsigned)s_ring.brightness,
              (unsigned)s_ring.red,
              (unsigned)s_ring.green,
@@ -237,9 +250,21 @@ static void neopixel_publish_state_locked(void) {
     esp_mqtt_client_publish(g_app.mqtt, MQTT_RING_STATE_TOPIC, payload, 0, 1, 1);
 }
 
+static void neopixel_publish_default_state_locked(void) {
+    if (!g_app.mqtt || !g_app.ip_ready) return;
+
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"mode\":\"%s\",\"white_brightness\":%u}",
+             neopixel_default_mode_name(),
+             (unsigned)s_ring_default_white_brightness);
+    esp_mqtt_client_publish(g_app.mqtt, MQTT_RING_DEFAULT_STATE_TOPIC, payload, 0, 1, 1);
+}
+
 void neopixel_publish_state(void) {
     if (!s_ring_mutex) return;
     if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    neopixel_publish_default_state_locked();
     neopixel_publish_state_locked();
     xSemaphoreGive(s_ring_mutex);
 }
@@ -257,7 +282,8 @@ void neopixel_suppress_default_for_snapshot(void) {
                  (unsigned)NEOPIXEL_SNAPSHOT_SUPPRESS_MS);
         neopixel_publish_state_locked();
     } else {
-        ESP_LOGI(TAG, "Snapshot received while NeoPixel is in default mode; leaving default red blink unchanged");
+        ESP_LOGI(TAG, "Snapshot received while NeoPixel is in default mode; leaving %s unchanged",
+                 neopixel_default_mode_name());
     }
 
     xSemaphoreGive(s_ring_mutex);
@@ -290,12 +316,59 @@ static bool neopixel_set_preset(const char *payload, uint8_t *r, uint8_t *g, uin
 
 static void neopixel_default_locked(void) {
     s_ring.command_active = false;
-    s_ring.is_on = false;
-    s_ring.red = 255;
+    s_ring.is_on = s_ring_default_mode == NEOPIXEL_DEFAULT_STEADY_WHITE;
+    s_ring.red = 0;
     s_ring.green = 0;
     s_ring.blue = 0;
     s_ring.white = 0;
     s_ring.brightness = NEOPIXEL_DEFAULT_BRIGHTNESS;
+    if (s_ring_default_mode == NEOPIXEL_DEFAULT_STEADY_WHITE) {
+        s_ring.white = 255;
+        s_ring.brightness = s_ring_default_white_brightness;
+    } else {
+        s_ring.red = 255;
+    }
+}
+
+static void neopixel_load_default_config(void) {
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("ring", NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "Using built-in NeoPixel default: red_blink");
+        return;
+    }
+
+    uint8_t mode = 0;
+    uint8_t white_brightness = 100;
+    if (nvs_get_u8(nvs, "def_mode", &mode) == ESP_OK && mode <= NEOPIXEL_DEFAULT_STEADY_WHITE) {
+        s_ring_default_mode = (neopixel_default_mode_t)mode;
+    }
+    if (nvs_get_u8(nvs, "def_white_bri", &white_brightness) == ESP_OK) {
+        s_ring_default_white_brightness = white_brightness;
+    }
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Loaded NeoPixel default mode=%s white_brightness=%u",
+             neopixel_default_mode_name(), (unsigned)s_ring_default_white_brightness);
+}
+
+static void neopixel_save_default_config(void) {
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("ring", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NeoPixel default NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(nvs, "def_mode", (uint8_t)s_ring_default_mode);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "def_white_bri", s_ring_default_white_brightness);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NeoPixel default NVS save failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(nvs);
 }
 
 void neopixel_handle_cmd(const char *payload) {
@@ -312,8 +385,12 @@ void neopixel_handle_cmd(const char *payload) {
         payload_contains_token_ci(payload, "auto") ||
         payload_contains_token_ci(payload, "red_blink")) {
         neopixel_default_locked();
+        esp_err_t err = neopixel_apply_locked();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "NeoPixel default apply failed: %s", esp_err_to_name(err));
+        }
         neopixel_publish_state_locked();
-        ESP_LOGI(TAG, "NeoPixel reverted to default red blink by command");
+        ESP_LOGI(TAG, "NeoPixel reverted to default %s by command", neopixel_default_mode_name());
         xSemaphoreGive(s_ring_mutex);
         return;
     }
@@ -459,6 +536,51 @@ void neopixel_handle_cmd(const char *payload) {
     xSemaphoreGive(s_ring_mutex);
 }
 
+void neopixel_handle_default_cmd(const char *payload) {
+    if (!payload || !payload[0] || !s_ring_mutex) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGW(TAG, "NeoPixel default command dropped: busy");
+        return;
+    }
+
+    bool recognized = false;
+    if (payload_contains_token_ci(payload, "white")) {
+        s_ring_default_mode = NEOPIXEL_DEFAULT_STEADY_WHITE;
+        s_ring_default_white_brightness = 100;
+        int brightness = 0;
+        if (parse_int_after_key(payload, "brightness", &brightness)) {
+            s_ring_default_white_brightness = clamp_u8_int(brightness);
+        }
+        recognized = true;
+    } else if (payload_contains_token_ci(payload, "red_blink") ||
+               payload_contains_token_ci(payload, "blink_red") ||
+               payload_contains_token_ci(payload, "red")) {
+        s_ring_default_mode = NEOPIXEL_DEFAULT_RED_BLINK;
+        recognized = true;
+    }
+
+    if (!recognized) {
+        ESP_LOGW(TAG, "NeoPixel default command ignored (unrecognized): %s", payload);
+        xSemaphoreGive(s_ring_mutex);
+        return;
+    }
+
+    neopixel_save_default_config();
+    neopixel_default_locked();
+    esp_err_t err = neopixel_apply_locked();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NeoPixel default apply failed: %s", esp_err_to_name(err));
+    }
+    neopixel_publish_default_state_locked();
+    neopixel_publish_state_locked();
+    ESP_LOGI(TAG, "NeoPixel default mode set to %s white_brightness=%u",
+             neopixel_default_mode_name(), (unsigned)s_ring_default_white_brightness);
+    xSemaphoreGive(s_ring_mutex);
+}
+
 static void neopixel_task(void *arg) {
     (void)arg;
 
@@ -469,17 +591,26 @@ static void neopixel_task(void *arg) {
                 if (s_ring.command_active) {
                     if ((int32_t)(now - s_ring.command_expires_at) >= 0) {
                         neopixel_default_locked();
+                        esp_err_t err = neopixel_apply_locked();
+                        if (err != ESP_OK) {
+                            ESP_LOGE(TAG, "NeoPixel default apply failed after command timeout: %s", esp_err_to_name(err));
+                        }
                         neopixel_publish_state_locked();
-                        ESP_LOGI(TAG, "NeoPixel command timeout expired; reverted to default red blink");
+                        ESP_LOGI(TAG, "NeoPixel command timeout expired; reverted to default %s", neopixel_default_mode_name());
                     }
                 } else {
-                    s_ring.blink_on = !s_ring.blink_on;
-                    esp_err_t err = neopixel_write_solid_locked(
-                        s_ring.blink_on,
-                        NEOPIXEL_DEFAULT_BRIGHTNESS,
-                        255, 0, 0, 0);
+                    esp_err_t err;
+                    if (s_ring_default_mode == NEOPIXEL_DEFAULT_STEADY_WHITE) {
+                        err = neopixel_apply_locked();
+                    } else {
+                        s_ring.blink_on = !s_ring.blink_on;
+                        err = neopixel_write_solid_locked(
+                            s_ring.blink_on,
+                            NEOPIXEL_DEFAULT_BRIGHTNESS,
+                            255, 0, 0, 0);
+                    }
                     if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "NeoPixel default blink failed: %s", esp_err_to_name(err));
+                        ESP_LOGE(TAG, "NeoPixel default apply failed: %s", esp_err_to_name(err));
                     }
                 }
             }
@@ -1361,12 +1492,13 @@ void neopixel_service_init(void) {
 
     if (xSemaphoreTake(s_ring_mutex, pdMS_TO_TICKS(250)) == pdTRUE) {
         s_ring.ready = true;
+        neopixel_load_default_config();
         neopixel_default_locked();
         xSemaphoreGive(s_ring_mutex);
     }
 
     xTaskCreate(neopixel_task, "neopixel_task", 4096, NULL, 3, NULL);
-    ESP_LOGI(TAG, "NeoPixel ring defaulting to 2 Hz full-red blink on GPIO%d with %d LEDs", NEOPIXEL_GPIO, NEOPIXEL_COUNT);
+    ESP_LOGI(TAG, "NeoPixel ring defaulting to %s on GPIO%d with %d LEDs", neopixel_default_mode_name(), NEOPIXEL_GPIO, NEOPIXEL_COUNT);
 #else
     ESP_LOGI(TAG, "NeoPixel support disabled at compile time");
 #endif

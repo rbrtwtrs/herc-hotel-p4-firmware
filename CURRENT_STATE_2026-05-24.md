@@ -36,11 +36,13 @@ This document records the known-good state and the remaining operational caveat 
   - GPIO3
   - 18 LEDs
   - SK6812/GRBW RGBW
-  - Default is full-brightness red blink at 2 Hz.
+  - Built-in fallback default is full-brightness red blink at 2 Hz.
+  - Saved default mode is configurable over MQTT and stored in ESP32-P4 NVS flash.
+  - Current saved default on the bench is steady RGBW white at brightness `100` on the 0-255 scale.
   - Named MQTT color commands are allowed: `red`, `white`, `green`, `blue`, `cyan`, `magenta`, and `yellow`.
   - Arbitrary RGB numeric commands remain disabled.
   - Command brightness can be set with payloads such as `red brightness=32`, `white brightness=32`, or `green brightness=26`.
-  - Commands time out after 10 minutes and return to default red blink.
+  - Commands time out after 10 minutes and return to the saved default mode.
   - Any `/snapshot.jpg` request preserves the current LED ring setting and, if a command is active, resets that command timeout to 10 minutes.
 
 ## MQTT Commands
@@ -49,9 +51,16 @@ This document records the known-good state and the remaining operational caveat 
 - OTA state: `herc-hotel-p4/ota/state`
 - Reboot: `herc-hotel-p4/cmd/reboot`
 - Ring: `herc-hotel-p4/cmd/ring`
+- Ring default mode: `herc-hotel-p4/cmd/ring_default`
 - Leak threshold: `herc-hotel-p4/cmd/leak_threshold`
 
 Do not publish retained messages to command topics.
+
+Ring default mode commands are saved in NVS and affect startup, `default`/`auto` ring commands, and command timeout fallback:
+
+- `red_blink` returns the saved default to the original 2 Hz red blink.
+- `white brightness=100` sets the saved default to steady RGBW white at brightness value `100` on the 0-255 scale.
+- `white brightness=255` sets the saved default to steady RGBW white at full brightness.
 
 ## Verified Network OTA
 
@@ -96,6 +105,16 @@ The network OTA path has been verified without using serial for the update:
   - MQTT ring command `off` followed by `/snapshot.jpg` left the ring off while resetting `timeout_s` to about `600`.
   - Final `default` command returned the ring to full-brightness default red blink.
   - Note: `/camera_status` still reported stale `last_error:"capture_failed:0xb006"` after rapid snapshot testing, but `/snapshot.jpg` returned valid JPEGs and health remained online.
+- Later OTA update on 2026-06-01 added the persistent ring default mode command:
+  - Build path: `C:\ocbuild\herc-hotel-p4-defaultmode-ota-20260601`.
+  - OTA URL: `http://10.1.70.131:8010/herc_hotel_p4.bin`.
+  - MQTT OTA state sequence: fresh `started` then fresh `success_restarting`.
+  - Device rebooted and republished `herc-hotel-p4/status online`.
+  - Post-OTA `/camera_status` returned `ready:true`, `last_error:"ok"`, and `capture_errors:0`.
+  - Post-OTA `/snapshot.jpg` returned `HTTP 200` JPEG.
+  - MQTT ring default command `white brightness=100` saved NVS default state `{"mode":"steady_white","white_brightness":100}`.
+  - Final retained ring state: steady white, `brightness:100`, RGBW `0,0,0,255`.
+  - MQTT command topics were published with `retain=false`; temporary HTTP server was stopped after OTA.
 
 The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and enables plain HTTP OTA:
 
@@ -106,8 +125,9 @@ The repo default `sdkconfig` now matches the Waveshare/PSRAM configuration and e
 
 Verified OTA app artifact:
 
-- App image: `herc_hotel_p4.bin`, SHA256 `5ED80AC0FCD147FD3720550DA9EF4B1D18EC7A0880243941130295A83F6CD576`
-- App size: `1079776` bytes
+- App image: `C:\ocbuild\herc-hotel-p4-defaultmode-ota-20260601\build\herc_hotel_p4.bin`
+- SHA256: `293997061F5D0F55AE7636BD6B7911A1C680D095B1366FB498FA17A7C4720652`
+- App size: `1094656` bytes
 
 For future OTA updates:
 

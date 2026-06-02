@@ -65,6 +65,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             int sub_reboot_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_REBOOT_TOPIC, 1);
             int sub_leak_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_LEAK_THRESHOLD_TOPIC, 1);
             int sub_ring_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_RING_TOPIC, 1);
+            int sub_ring_default_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_RING_DEFAULT_TOPIC, 1);
             int sub_telemetry_id = esp_mqtt_client_subscribe(g_app.mqtt, MQTT_CMD_TELEMETRY_MODE_TOPIC, 1);
             mqtt_publish_homeassistant_discovery();
             neopixel_publish_state();
@@ -75,6 +76,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_reboot_id, MQTT_CMD_REBOOT_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_leak_id, MQTT_CMD_LEAK_THRESHOLD_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_ring_id, MQTT_CMD_RING_TOPIC);
+            ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_ring_default_id, MQTT_CMD_RING_DEFAULT_TOPIC);
             ESP_LOGI(TAG, "MQTT subscribe msg_id=%d topic=%s", sub_telemetry_id, MQTT_CMD_TELEMETRY_MODE_TOPIC);
             break;
         }
@@ -105,6 +107,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                        strncmp(event->topic, MQTT_CMD_RING_TOPIC, event->topic_len) == 0) {
                 ESP_LOGI(TAG, "NeoPixel ring command received: %s", data_buf);
                 neopixel_handle_cmd(data_buf);
+            } else if (event->topic_len == (int)strlen(MQTT_CMD_RING_DEFAULT_TOPIC) &&
+                       strncmp(event->topic, MQTT_CMD_RING_DEFAULT_TOPIC, event->topic_len) == 0) {
+                ESP_LOGI(TAG, "NeoPixel ring default command received: %s", data_buf);
+                neopixel_handle_default_cmd(data_buf);
             } else if (event->topic_len == (int)strlen(MQTT_CMD_TELEMETRY_MODE_TOPIC) &&
                        strncmp(event->topic, MQTT_CMD_TELEMETRY_MODE_TOPIC, event->topic_len) == 0) {
                 ESP_LOGI(TAG, "Telemetry mode command received: %s", data_buf);
