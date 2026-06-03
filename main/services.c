@@ -35,6 +35,7 @@ static float s_motor_temp_offset_c = 0.93f;
 static float s_motor_temp_last_raw_c = 0.0f;
 static bool s_motor_temp_last_raw_valid = false;
 static SemaphoreHandle_t s_ring_mutex = NULL;
+static SemaphoreHandle_t s_ads_mutex = NULL;
 
 typedef enum {
     TELEMETRY_MODE_SIMPLE = 0,
@@ -62,14 +63,16 @@ typedef enum {
     NEOPIXEL_DEFAULT_STEADY_WHITE = 1,
 } neopixel_default_mode_t;
 
-#define ADS1115_FULL_SCALE_V 4.096f
+#define ADS1115_FULL_SCALE_V 6.144f
 #define ADS1115_RAW_SCALE 32768.0f
 #define MOTOR_TEMP_SENSE_RESISTOR_OHMS 2700.0f
 #define PRESSURE_SENSOR_FULL_SCALE_V 5.0f
 #define PRESSURE_SENSOR_FULL_SCALE_PSI 6000.0f
 #define MAIN_PRESSURE_CAL_POINT_COUNT 6
+// Reservoir level sensors are 4-20 mA loops across 250 ohms, so the ADC sees about 1-5 V.
 #define RES_LEVEL_DEFAULT_ZERO_V 1.0f
 #define RES_LEVEL_DEFAULT_FULL_V 5.0f
+#define ADS_FILTER_ALPHA 0.25f
 
 typedef struct {
     uint8_t channel;
@@ -89,15 +92,20 @@ typedef struct {
     float volts;
 } pressure_cal_point_t;
 
+typedef struct {
+    bool valid;
+    float volts;
+} ads_filter_state_t;
+
 static res_level_cal_t s_res_level_cal[4] = {
-    {.zero_v = 1.033f, .full_v = RES_LEVEL_DEFAULT_FULL_V},
-    {.zero_v = 1.032f, .full_v = RES_LEVEL_DEFAULT_FULL_V},
+    {.zero_v = 1.100f, .full_v = 5.200f},
+    {.zero_v = 1.100f, .full_v = 5.200f},
     {.zero_v = RES_LEVEL_DEFAULT_ZERO_V, .full_v = RES_LEVEL_DEFAULT_FULL_V},
     {.zero_v = RES_LEVEL_DEFAULT_ZERO_V, .full_v = RES_LEVEL_DEFAULT_FULL_V},
 };
 
 static const pressure_cal_point_t s_main_pressure_cal[MAIN_PRESSURE_CAL_POINT_COUNT] = {
-    {.psi = 0.0f, .volts = 0.000f},
+    {.psi = 0.0f, .volts = 1.004f},
     {.psi = 1000.0f, .volts = 1.765f},
     {.psi = 1500.0f, .volts = 2.120f},
     {.psi = 2000.0f, .volts = 2.497f},
@@ -120,7 +128,7 @@ static const ads_named_channel_t s_res_level_channels[] = {
 };
 
 static const ads_named_channel_t s_res_level_simple_aliases[] = {
-    {0, "hydralic_comp", "Hydralic Comp"},
+    {0, "hydralic_comp", "Hydraulic Comp"},
     {1, "elec_comp", "Elec Comp"},
 };
 
@@ -150,6 +158,8 @@ static neopixel_state_t s_ring = {
     .command_expires_at = 0,
     .handle = NULL,
 };
+
+static ads_filter_state_t s_ads_filter[4][4] = {0};
 static neopixel_default_mode_t s_ring_default_mode = NEOPIXEL_DEFAULT_RED_BLINK;
 static uint8_t s_ring_default_white_brightness = 100;
 
@@ -774,6 +784,9 @@ static bool i2c_probe(uint8_t addr) {
 
 static esp_err_t ads1115_read_channel(uint8_t addr, uint8_t channel, int16_t *raw_out) {
     if (!s_i2c_bus || !raw_out || channel > 3) return ESP_ERR_INVALID_ARG;
+    if (!s_ads_mutex || xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -782,13 +795,16 @@ static esp_err_t ads1115_read_channel(uint8_t addr, uint8_t channel, int16_t *ra
     };
     i2c_master_dev_handle_t dev = NULL;
     esp_err_t err = i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &dev);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_ads_mutex);
+        return err;
+    }
 
     uint16_t mux_bits = (uint16_t)(0x04 + channel); // AINx vs GND
     uint16_t config = 0;
     config |= (1u << 15);          // OS: start single conversion
     config |= (mux_bits << 12);    // MUX
-    config |= (0x01u << 9);        // PGA +-4.096V
+    config |= (0x00u << 9);        // PGA +-6.144V for 0-5V sensor inputs
     config |= (1u << 8);           // MODE: single-shot
     config |= (0x04u << 5);        // DR: 128 SPS
     config |= 0x03u;               // comparator disable
@@ -797,15 +813,38 @@ static esp_err_t ads1115_read_channel(uint8_t addr, uint8_t channel, int16_t *ra
     err = i2c_master_transmit(dev, cfg_wr, sizeof(cfg_wr), 30);
     if (err != ESP_OK) {
         i2c_master_bus_rm_device(dev);
+        xSemaphoreGive(s_ads_mutex);
         return err;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    uint8_t cfg_reg = 0x01;
+    uint8_t cfg_rd[2] = {0};
+    bool conversion_ready = false;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        err = i2c_master_transmit_receive(dev, &cfg_reg, 1, cfg_rd, 2, 30);
+        if (err != ESP_OK) {
+            i2c_master_bus_rm_device(dev);
+            xSemaphoreGive(s_ads_mutex);
+            return err;
+        }
+        uint16_t current_config = ((uint16_t)cfg_rd[0] << 8) | cfg_rd[1];
+        if (current_config & (1u << 15)) {
+            conversion_ready = true;
+            break;
+        }
+    }
+    if (!conversion_ready) {
+        i2c_master_bus_rm_device(dev);
+        xSemaphoreGive(s_ads_mutex);
+        return ESP_ERR_TIMEOUT;
+    }
 
     uint8_t reg = 0x00;
     uint8_t data[2] = {0};
     err = i2c_master_transmit_receive(dev, &reg, 1, data, 2, 30);
     i2c_master_bus_rm_device(dev);
+    xSemaphoreGive(s_ads_mutex);
     if (err != ESP_OK) return err;
 
     *raw_out = (int16_t)((data[0] << 8) | data[1]);
@@ -814,6 +853,19 @@ static esp_err_t ads1115_read_channel(uint8_t addr, uint8_t channel, int16_t *ra
 
 static float ads1115_raw_to_volts(int16_t raw) {
     return ((float)raw) * ADS1115_FULL_SCALE_V / ADS1115_RAW_SCALE;
+}
+
+static float ads1115_filter_update(uint8_t addr, uint8_t channel, float volts) {
+    if (addr < 0x48 || addr > 0x4B || channel > 3) return volts;
+
+    ads_filter_state_t *state = &s_ads_filter[addr - 0x48][channel];
+    if (!state->valid) {
+        state->valid = true;
+        state->volts = volts;
+    } else {
+        state->volts += ADS_FILTER_ALPHA * (volts - state->volts);
+    }
+    return state->volts;
 }
 
 static int motor_temp_volts_to_centi_c(float volts) {
@@ -835,7 +887,12 @@ static int res_level_volts_to_percent_int(uint8_t channel, float volts) {
 }
 
 static int volts_to_psi_int(float volts) {
-    float psi = (volts / PRESSURE_SENSOR_FULL_SCALE_V) * PRESSURE_SENSOR_FULL_SCALE_PSI;
+    // Aux pressure inputs use common 0.5-4.5 V pressure transducers. Readings below the
+    // sensor floor are treated as zero so disconnected/floating channels do not report pressure.
+    const float sensor_zero_v = 0.5f;
+    const float sensor_full_v = 4.5f;
+    if (volts <= sensor_zero_v) return 0;
+    float psi = ((volts - sensor_zero_v) / (sensor_full_v - sensor_zero_v)) * PRESSURE_SENSOR_FULL_SCALE_PSI;
     if (psi < 0.0f) psi = 0.0f;
     if (psi > PRESSURE_SENSOR_FULL_SCALE_PSI) psi = PRESSURE_SENSOR_FULL_SCALE_PSI;
     return (int)(psi + 0.5f);
@@ -909,6 +966,44 @@ void telemetry_mode_handle_cmd(const char *payload) {
     telemetry_mode_publish_state();
 }
 
+static void publish_main_hyd_pressure_sample(bool verbose) {
+    int16_t raw = 0;
+    if (ads1115_read_channel(0x4B, 0, &raw) != ESP_OK) return;
+
+    float raw_volts = ads1115_raw_to_volts(raw);
+    float volts = ads1115_filter_update(0x4B, 0, raw_volts);
+    int psi = main_pressure_volts_to_psi_int(volts);
+    char topic[128];
+    char payload[192];
+
+    if (verbose) {
+        snprintf(topic, sizeof(topic), "%s/ads1115/0x4B/ch0", MQTT_I2C_TOPIC_PREFIX);
+        snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"filtered_volts\":%.5f,\"psi\":%d,\"calibrated\":true,\"filtered\":true}",
+                 raw, (double)raw_volts, (double)volts, psi);
+        esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+    }
+
+    snprintf(topic, sizeof(topic), "%s/main_hyd_press", MQTT_I2C_TOPIC_PREFIX);
+    if (verbose) {
+        snprintf(payload, sizeof(payload), "{\"psi\":%d,\"volts\":%.5f,\"raw_volts\":%.5f,\"raw\":%d,\"calibrated\":true,\"filtered\":true}",
+                 psi, (double)volts, (double)raw_volts, raw);
+    } else {
+        snprintf(payload, sizeof(payload), "{\"psi\":%d}", psi);
+    }
+    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+}
+
+static void main_hyd_pressure_task(void *arg) {
+    (void)arg;
+
+    while (1) {
+        if (g_app.mqtt && g_app.ip_ready && s_i2c_bus) {
+            publish_main_hyd_pressure_sample(s_telemetry_mode == TELEMETRY_MODE_VERBOSE);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 static void i2c_publish_task(void *arg) {
     while (1) {
         if (g_app.mqtt && g_app.ip_ready && s_i2c_bus) {
@@ -927,9 +1022,11 @@ static void i2c_publish_task(void *arg) {
 
                 if (addr >= 0x48 && addr <= 0x4B) {
                     for (uint8_t ch = 0; ch < 4; ch++) {
+                        if (addr == 0x4B && ch == 0) continue;
                         int16_t raw = 0;
                         if (ads1115_read_channel(addr, ch, &raw) == ESP_OK) {
-                            float volts = ads1115_raw_to_volts(raw);
+                            float raw_volts = ads1115_raw_to_volts(raw);
+                            float volts = ads1115_filter_update(addr, ch, raw_volts);
                             char topic[96];
                             char payload[192];
 
@@ -938,24 +1035,24 @@ static void i2c_publish_task(void *arg) {
 
                                 if (addr == 0x48 && ch == 0) {
                                     int temp_centi_c = motor_temp_volts_to_centi_c(volts);
-                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"temperature_c\":%.2f,\"raw_temperature_c\":%.2f,\"offset_c\":%.2f}",
-                                             raw, (double)volts, (double)temp_centi_c / 100.0,
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"filtered_volts\":%.5f,\"temperature_c\":%.2f,\"raw_temperature_c\":%.2f,\"offset_c\":%.2f,\"filtered\":true}",
+                                             raw, (double)raw_volts, (double)volts, (double)temp_centi_c / 100.0,
                                              (double)s_motor_temp_last_raw_c, (double)s_motor_temp_offset_c);
                                 } else if (addr == 0x49) {
                                     const char *state = (volts <= s_leak_wet_threshold_v) ? "WET" : "DRY";
-                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"state\":\"%s\"}",
-                                             raw, (double)volts, state);
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"filtered_volts\":%.5f,\"state\":\"%s\",\"filtered\":true}",
+                                             raw, (double)raw_volts, (double)volts, state);
                                 } else if (addr == 0x4A) {
                                     int pct = res_level_volts_to_percent_int(ch, volts);
-                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"percent\":%d,\"zero_v\":%.3f,\"full_v\":%.3f}",
-                                             raw, (double)volts, pct, (double)s_res_level_cal[ch].zero_v,
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"filtered_volts\":%.5f,\"percent\":%d,\"zero_v\":%.3f,\"full_v\":%.3f,\"filtered\":true}",
+                                             raw, (double)raw_volts, (double)volts, pct, (double)s_res_level_cal[ch].zero_v,
                                              (double)s_res_level_cal[ch].full_v);
                                 } else if (addr == 0x4B) {
                                     int psi = (ch == 0) ? main_pressure_volts_to_psi_int(volts) : volts_to_psi_int(volts);
-                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"psi\":%d%s}",
-                                             raw, (double)volts, psi, ch == 0 ? ",\"calibrated\":true" : "");
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"filtered_volts\":%.5f,\"psi\":%d,\"filtered\":true}",
+                                             raw, (double)raw_volts, (double)volts, psi);
                                 } else {
-                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f}", raw, (double)volts);
+                                    snprintf(payload, sizeof(payload), "{\"raw\":%d,\"volts\":%.5f,\"filtered_volts\":%.5f,\"filtered\":true}", raw, (double)raw_volts, (double)volts);
                                 }
                                 esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
                             }
@@ -1003,26 +1100,24 @@ static void i2c_publish_task(void *arg) {
                                 s_res_level_cal[ch].last_v = volts;
                                 s_res_level_cal[ch].last_valid = true;
                                 int pct = res_level_volts_to_percent_int(ch, volts);
-                                if (verbose) {
-                                    for (size_t i = 0; i < sizeof(s_res_level_channels) / sizeof(s_res_level_channels[0]); i++) {
-                                        if (s_res_level_channels[i].channel != ch) continue;
-                                        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_channels[i].key);
-                                        snprintf(payload, sizeof(payload), "{\"percent\":%d,\"volts\":%.5f,\"raw\":%d,\"zero_v\":%.3f,\"full_v\":%.3f}",
-                                                 pct, (double)volts, raw, (double)s_res_level_cal[ch].zero_v,
-                                                 (double)s_res_level_cal[ch].full_v);
-                                        esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
-                                        break;
-                                    }
+
+                                for (size_t i = 0; i < sizeof(s_res_level_channels) / sizeof(s_res_level_channels[0]); i++) {
+                                    if (s_res_level_channels[i].channel != ch) continue;
+                                    snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_channels[i].key);
+                                    snprintf(payload, sizeof(payload), "{\"percent\":%d,\"volts\":%.5f,\"raw\":%d,\"zero_v\":%.3f,\"full_v\":%.3f}",
+                                             pct, (double)volts, raw, (double)s_res_level_cal[ch].zero_v,
+                                             (double)s_res_level_cal[ch].full_v);
+                                    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                    break;
                                 }
 
-                                if (!verbose) {
-                                    for (size_t i = 0; i < sizeof(s_res_level_simple_aliases) / sizeof(s_res_level_simple_aliases[0]); i++) {
-                                        if (s_res_level_simple_aliases[i].channel != ch) continue;
-                                        snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_simple_aliases[i].key);
-                                        snprintf(payload, sizeof(payload), "{\"percent\":%d}", pct);
-                                        esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
-                                        break;
-                                    }
+                                for (size_t i = 0; i < sizeof(s_res_level_simple_aliases) / sizeof(s_res_level_simple_aliases[0]); i++) {
+                                    if (s_res_level_simple_aliases[i].channel != ch) continue;
+                                    snprintf(topic, sizeof(topic), "%s/%s", MQTT_I2C_TOPIC_PREFIX, s_res_level_simple_aliases[i].key);
+                                    snprintf(payload, sizeof(payload), "{\"percent\":%d,\"volts\":%.5f,\"raw\":%d,\"source\":\"%s\"}",
+                                             pct, (double)volts, raw, s_res_level_channels[ch].key);
+                                    esp_mqtt_client_publish(g_app.mqtt, topic, payload, 0, 0, 0);
+                                    break;
                                 }
                             } else if (addr == 0x4B) {
                                 int psi = (ch == 0) ? main_pressure_volts_to_psi_int(volts) : volts_to_psi_int(volts);
@@ -1317,6 +1412,10 @@ void i2c_service_init(void) {
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "I2C bus ready on SDA=%d SCL=%d", I2C_SDA_GPIO, I2C_SCL_GPIO);
         ESP_LOGI(TAG, "I2C MQTT scan topic: %s", MQTT_I2C_SCAN_TOPIC);
+        if (!s_ads_mutex) {
+            s_ads_mutex = xSemaphoreCreateMutex();
+        }
+        xTaskCreate(main_hyd_pressure_task, "main_hyd_1hz", 4096, NULL, 4, NULL);
         xTaskCreate(i2c_publish_task, "i2c_pub_task", 6144, NULL, 4, NULL);
 
         if (i2c_probe(s_bme_addr)) {
